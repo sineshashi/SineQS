@@ -124,9 +124,142 @@ impl Segment {
     }
 }
 
+#[derive(Debug)]
+struct SegmentOffset {
+    message_offset: i64,
+    physical_offset: i32
+}
+
+impl SegmentOffset {
+    fn size_of_single_record() -> i32 {
+        return 12
+    }
+
+    fn to_bytes(&self) -> [u8; 12] {
+        let mut bytes = [0u8; 12];
+        bytes[0..8].copy_from_slice(&i64::to_le_bytes(self.message_offset));
+        bytes[8..].copy_from_slice(&i32::to_le_bytes(self.physical_offset));
+        return bytes;
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        //Returns None if bytes are not valid.
+        let mut msg_os_bytes = [0u8; 8];
+        msg_os_bytes.copy_from_slice(&bytes[..8]);
+        let msg_off_set = i64::from_le_bytes(msg_os_bytes);
+        if msg_off_set == 0 {
+            return None
+        } else {
+            let mut last_bytes = [0u8; 4];
+            last_bytes.copy_from_slice(&bytes[8..]);
+            let physical_offset = i32::from_le_bytes(last_bytes);
+            return Some(Self {
+                message_offset: msg_off_set,
+                physical_offset: physical_offset
+            })
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SegmentIndexPage {
+    start_offset: i32,
+    segment_id: i32,
+    max_number_of_records: i32,
+    records: Vec<SegmentOffset>
+}
+
+impl SegmentIndexPage {
+    fn new(max_number_of_records: i32, start_offset: i32, segment_id: i32) -> Self {
+        return Self{
+            max_number_of_records: max_number_of_records,
+            start_offset: start_offset,
+            records: vec![],
+            segment_id: segment_id
+        }
+    }
+
+    fn from_bytes(max_number_of_records: i32, start_offset: i32, segment_id: i32, bytes: &[u8]) -> Self {
+        let size = SegmentOffset::size_of_single_record() as usize;
+        let mut records = vec![];
+        for i in 0..max_number_of_records {
+            let offset_opt = SegmentOffset::from_bytes(
+                &bytes[size*(i as usize)..size*((i+1) as usize)]
+            );
+            if let Some(offset) = offset_opt {
+                records.push(offset)
+            } else {
+                //No more records in the page.
+                break
+            }
+        }
+        return Self {
+            max_number_of_records: max_number_of_records,
+            segment_id: segment_id,
+            start_offset: start_offset,
+            records: records
+        }
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0u8; (self.max_number_of_records * SegmentOffset::size_of_single_record()) as usize];
+        let mut i = 0;
+        let size = SegmentOffset::size_of_single_record() as usize;
+        for sgoffst in &self.records {
+            bytes[i*size..(i+1)*size].copy_from_slice(&sgoffst.to_bytes());
+            i += 1;
+        };
+        return bytes;
+    }
+}
+
+#[derive(Debug)]
+struct SegmentIndex {
+    segment_id: i32,
+    file: String,
+    active: bool,
+    write_handler: Option<File>,
+    number_of_bytes: usize
+}
+
+impl SegmentIndex {
+    fn new(
+        segment_id: i32,
+        folder: String,
+        active: bool
+    ) -> Self {
+        let file = format!("{}/{}.index", folder, segment_id);
+        let write_handler;
+        if active {
+            write_handler = Some(
+                OpenOptions::new()
+                .write(true)
+                .read(true)
+                .open(String::from(&file))
+                .expect(&format!("Could not open file {}", &file))
+            );
+        } else {
+            write_handler = None;
+        };
+        let read = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(String::from(&file))
+            .expect(&format!("Could not open file {}", &file));
+        let number_of_bytes = read.bytes().count();
+        return Self {
+            segment_id: segment_id,
+            file: file,
+            active: true,
+            write_handler: write_handler,
+            number_of_bytes: number_of_bytes
+        }
+    }
+}
+
 #[cfg(test)]
 mod SegmentTests {
-    use crate::{Segment, Message};
+    use crate::{Message, Segment};
 
     #[test]
     fn test_segment_functions() {
