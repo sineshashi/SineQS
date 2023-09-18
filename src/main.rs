@@ -61,7 +61,6 @@ All the message are appended until max size is reached.
 */
 #[derive(Debug)]
 struct Segment {
-    segment_size: i32,
     segment_id: i64,
     file: String,
     active: bool,
@@ -72,7 +71,7 @@ struct Segment {
 
 impl Segment {
     ///creates new Segment by creating new file if necessary else loads the existing file.
-    fn new(segment_size: i32, segment_id: i64, folder: String, active: bool) -> Self {
+    fn new(segment_id: i64, folder: String, active: bool) -> Self {
         let write_handler;
         let file = format!("{}/{}.dat", folder, segment_id);
         if active {
@@ -93,7 +92,6 @@ impl Segment {
         let number_of_bytes = read.bytes().count();
         Self {
             segment_id: segment_id,
-            segment_size: segment_size,
             file: file,
             active: active,
             write_handler: write_handler,
@@ -118,27 +116,19 @@ impl Segment {
         }
         let wriatable_size = message.writable_size();
         let cnt_offset = self.number_of_bytes;
-        if self.number_of_bytes + wriatable_size as i32 > self.segment_size {
-            self.active = false;
-            self.write_handler = None;
-            return Err(MessageIOError::SegmentOverFlow(String::from(
-                "Segment over flow, can not write in the segment.",
-            )));
-        } else {
-            let _ = self
-                .write_handler
-                .as_ref()
-                .unwrap()
-                .write(&i32::to_le_bytes(wriatable_size as i32 - 4))?;
-            let _ = self
-                .write_handler
-                .as_ref()
-                .unwrap()
-                .write(&message.message_bytes)?;
-            self.write_handler.as_ref().unwrap().flush()?;
-            self.number_of_bytes += wriatable_size as i32;
-            return Ok(cnt_offset);
-        }
+        let _ = self
+            .write_handler
+            .as_ref()
+            .unwrap()
+            .write(&i32::to_le_bytes(wriatable_size as i32 - 4))?;
+        let _ = self
+            .write_handler
+            .as_ref()
+            .unwrap()
+            .write(&message.message_bytes)?;
+        self.write_handler.as_ref().unwrap().flush()?;
+        self.number_of_bytes += wriatable_size as i32;
+        return Ok(cnt_offset);
     }
 
     //Returns the message which starts at the given offset.
@@ -534,7 +524,6 @@ struct SegmentManager {
 
 impl SegmentManager {
     fn new(
-        segment_size: i32,
         segment_id: i64,
         folder: String,
         active: bool,
@@ -545,7 +534,7 @@ impl SegmentManager {
             .get_cnt_page_being_written(max_number_of_records_in_index_page)
             .expect("Latest index page could not be loaded.");
         return Self {
-            segment: Segment::new(segment_size, segment_id, String::from(&folder), active),
+            segment: Segment::new(segment_id, String::from(&folder), active),
             segment_index: segment_index,
             cnt_index_page: cnt_index_page
         };
@@ -620,7 +609,7 @@ mod SegmentTests {
     use crate::{Message, Segment, SegmentIndexPage, SegmentIndexPageCache, SegmentManager};
     #[test]
     fn test_segment_functions() {
-        let mut segment = Segment::new(8196, 1, String::from("."), true);
+        let mut segment = Segment::new(1, String::from("."), true);
         let bytes = "I am Shashi Kant.".as_bytes();
         let res = segment.add_message(Message {
             message_bytes: bytes.to_owned().into(),
@@ -670,7 +659,7 @@ mod SegmentTests {
 
     #[test]
     fn test_segment_manager() {
-        let mut manager = SegmentManager::new(8196, 1, String::from("./data"), true, 16);
+        let mut manager = SegmentManager::new(1, String::from("./data"), true, 16);
         let mut cache = SegmentIndexPageCache::new(100);
         let bytes = "I am Shashi Kant.".as_bytes().to_owned().to_vec();
         let message = Message{message_bytes: bytes};
