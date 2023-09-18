@@ -246,14 +246,15 @@ impl SegmentIndexPage {
         let mut inplace = false;
 
         while lo <= hi {
-            let mid = (lo + hi)/2;
+            let mid = (lo + hi) / 2;
             let mid_offset = SegmentOffset::from_bytes(
-                &self.bytes[(mid as usize)*(size as usize)..(mid as usize + 1)*(size as usize)]
+                &self.bytes[(mid as usize) * (size as usize)..(mid as usize + 1) * (size as usize)],
             );
             let pre_mid_offset;
             if mid != 0 {
                 pre_mid_offset = SegmentOffset::from_bytes(
-                    &self.bytes[(mid as usize - 1)*(size as usize)..(mid as usize)*(size as usize)]
+                    &self.bytes
+                        [(mid as usize - 1) * (size as usize)..(mid as usize) * (size as usize)],
                 );
             } else {
                 pre_mid_offset = None;
@@ -278,7 +279,7 @@ impl SegmentIndexPage {
                 }
             } else if mid_offset.as_ref().is_none() && pre_mid_offset.as_ref().is_some() {
                 if pre_mid_offset.as_ref().unwrap().message_offset == offset.message_offset {
-                    insertion_idx = Some(mid-1);
+                    insertion_idx = Some(mid - 1);
                     inplace = true;
                     break;
                 } else if pre_mid_offset.as_ref().unwrap().message_offset < offset.message_offset {
@@ -293,10 +294,12 @@ impl SegmentIndexPage {
                     inplace = true;
                     break;
                 } else if pre_mid_offset.as_ref().unwrap().message_offset == offset.message_offset {
-                    insertion_idx = Some(mid-1);
+                    insertion_idx = Some(mid - 1);
                     inplace = true;
                     break;
-                } else if pre_mid_offset.as_ref().unwrap().message_offset < offset.message_offset && offset.message_offset < mid_offset.as_ref().unwrap().message_offset {
+                } else if pre_mid_offset.as_ref().unwrap().message_offset < offset.message_offset
+                    && offset.message_offset < mid_offset.as_ref().unwrap().message_offset
+                {
                     insertion_idx = Some(mid);
                     break;
                 } else if pre_mid_offset.as_ref().unwrap().message_offset > offset.message_offset {
@@ -305,7 +308,7 @@ impl SegmentIndexPage {
                     lo = mid + 1;
                 }
             }
-        };
+        }
         let i = insertion_idx.unwrap();
         let write_offset = i * size;
         if !inplace && last_message_offset_res.as_ref().is_some() {
@@ -638,6 +641,138 @@ impl SegmentManager {
         }
         return Ok(None);
     }
+}
+
+/*
+This struct denotes the meta data of a segment, where does it start and end.
+*/
+#[derive(Debug)]
+struct SegmentRange {
+    segment_id: i64,
+    segment_range_start: i64,
+    segment_range_end: i64,
+}
+
+impl SegmentRange {
+    fn new(segment_id: i64, segment_range_start: i64, segment_range_end: i64) -> Self {
+        return Self {
+            segment_id: segment_id,
+            segment_range_end: segment_range_end,
+            segment_range_start: segment_range_start,
+        };
+    }
+
+    fn size_of_single_record() -> i32 {
+        //All the three, segment_id, start and end are 8 bytes = 64 bit integers.
+        return 24;
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0u8; 24];
+        bytes[0..8].copy_from_slice(&i64::to_le_bytes(self.segment_range_start));
+        bytes[8..16].copy_from_slice(&i64::to_le_bytes(self.segment_range_end));
+        bytes[16..24].copy_from_slice(&i64::to_le_bytes(self.segment_id));
+        return bytes;
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let mut start_bytes = [0u8; 8];
+        let mut end_bytes = [0u8; 8];
+        let mut id_bytes = [0u8; 8];
+        start_bytes.copy_from_slice(&bytes[0..8]);
+        end_bytes.copy_from_slice(&bytes[8..16]);
+        id_bytes.copy_from_slice(&bytes[16..32]);
+        return Self {
+            segment_range_start: i64::from_le_bytes(start_bytes),
+            segment_range_end: i64::from_le_bytes(end_bytes),
+            segment_id: i64::from_le_bytes(id_bytes),
+        };
+    }
+}
+
+#[derive(Debug)]
+struct SegmentRangeIndex {
+    number_of_rows: i32,
+    file: String,
+    write_handler: File,
+    index_mutex: Mutex<()>
+}
+
+impl SegmentRangeIndex {
+    fn new(file: String) -> Self {
+        let w_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(String::from(&file))
+            .expect(&format!("File could not be opened {:?}", &file));
+        let r_file = OpenOptions::new()
+            .read(true)
+            .open(String::from(&file))
+            .expect(&format!("File could not be opened {:?}", &file));
+        let number_of_bytes = r_file.bytes().count() as i32;
+        let number_of_rows = number_of_bytes / SegmentRange::size_of_single_record();
+        return Self {
+            number_of_rows: number_of_rows,
+            file: file,
+            write_handler: w_file,
+            index_mutex: Mutex::new(())
+        };
+    }
+
+    fn add_segment(
+        &mut self,
+        segment_id: i64,
+        segment_range_end: i64,
+        segment_range_start: i64,
+    ) -> Result<(), MessageIOError> {
+        let _guard = self.index_mutex.lock().unwrap();
+        self.write_handler.write(
+            &SegmentRange::new(segment_id, segment_range_start, segment_range_end).to_bytes(),
+        )?;
+        self.number_of_rows += 1;
+        self.write_handler.flush()?;
+        return Ok(());
+    }
+
+    fn find_segment(
+        &self,
+        message_offset: i64
+    ) -> Result<Option<i64>, MessageIOError>{
+        //returns segment_id if found else None
+        let size = SegmentRange::size_of_single_record();
+        let mut lo = 0;
+        let mut hi = self.number_of_rows;
+        let r_file = OpenOptions::new()
+            .read(true)
+            .open(String::from(&self.file))?;
+        while lo <= hi {
+            let mid = (lo + hi)/2;
+            let mut bytes = vec![0u8; size as usize];
+            r_file.seek_read(&mut bytes, mid as u64 * size as u64)?;
+            let range = SegmentRange::from_bytes(&bytes);
+            if range.segment_range_start <= message_offset && message_offset <= range.segment_range_end {
+                return Ok(Some(range.segment_id));
+            } else if message_offset < range.segment_range_start {
+                hi = mid - 1;
+            } else {
+                lo = mid + 1;
+            }
+        };
+        return Ok(None);
+    }
+}
+
+#[derive(Debug)]
+struct Partition {
+    partition_id: i32,
+    cnt_range_start: i64,
+    cnt_range_end: i64,
+    cnt_msg_offset: i64,
+    least_msg_offset: i64,
+    cnt_active_segment_id: i64,
+    folder: String,
+    range_index: SegmentRangeIndex
 }
 
 #[cfg(test)]
