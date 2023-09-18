@@ -1,4 +1,3 @@
-use core::num;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -32,21 +31,34 @@ impl From<std::io::Error> for MessageIOError {
     }
 }
 
+/*
+This stores the message in bytes.
+*/
 #[derive(Debug)]
 struct Message {
     message_bytes: Vec<u8>,
 }
 
 impl Message {
+    /*
+    returns current message length 
+    */
     fn size(&self) -> usize {
         return self.message_bytes.len();
     }
 
+    /*
+    Returns number of bytes in the message + 4(4 bytes are reserved to store the size.)
+    */
     fn writable_size(&self) -> usize {
         return 4 + self.size();
     }
 }
 
+/*
+This struct is responsible for all the read and write of messages in a segment file.
+All the message are appended until max size is reached.
+*/
 #[derive(Debug)]
 struct Segment {
     segment_size: i32,
@@ -59,6 +71,7 @@ struct Segment {
 }
 
 impl Segment {
+    ///creates new Segment by creating new file if necessary else loads the existing file.
     fn new(segment_size: i32, segment_id: i64, folder: String, active: bool) -> Self {
         let write_handler;
         let file = format!("{}/{}.dat", folder, segment_id);
@@ -89,6 +102,7 @@ impl Segment {
         }
     }
 
+    //Writes the message if space is available and returns the starting offset of the message which should be stored in the index.
     fn add_message(&mut self, message: Message) -> Result<i32, MessageIOError> {
         //Returns starting offset if successfully written.
         // In case of overflow, write handler is closed and active is set to false.
@@ -127,6 +141,7 @@ impl Segment {
         }
     }
 
+    //Returns the message which starts at the given offset.
     fn read_message(&self, offset: i32) -> Result<Message, MessageIOError> {
         let file = OpenOptions::new()
             .read(true)
@@ -144,6 +159,10 @@ impl Segment {
     }
 }
 
+
+/*
+This struct stores a unique id of messages which is message offset and the physical offset of message provided by `Segment` struct.
+*/
 #[derive(Debug)]
 struct SegmentOffset {
     message_offset: i64,
@@ -151,10 +170,12 @@ struct SegmentOffset {
 }
 
 impl SegmentOffset {
+    //Returns the size which will be taken to store the message offset (8 bytes) and physical offset (4 bytes)
     fn size_of_single_record() -> i32 {
         return 12;
     }
 
+    //Returns the byte representation by [message offset bytes, physical offset bytes]
     fn to_bytes(&self) -> [u8; 12] {
         let mut bytes = [0u8; 12];
         bytes[0..8].copy_from_slice(&i64::to_le_bytes(self.message_offset));
@@ -162,6 +183,7 @@ impl SegmentOffset {
         return bytes;
     }
 
+    //Loads the message from bytes and returns None if bytes do not represent a valid offset.
     fn from_bytes(bytes: &[u8]) -> Option<Self> {
         //Returns None if bytes are not valid.
         let mut msg_os_bytes = [0u8; 8];
@@ -181,6 +203,9 @@ impl SegmentOffset {
     }
 }
 
+/*
+This struct represents a page of given number of records which holds the data of message offset and physical offsets in increasing order.
+*/
 #[derive(Debug, Clone)]
 struct SegmentIndexPage {
     start_offset: i32,
@@ -190,6 +215,7 @@ struct SegmentIndexPage {
 }
 
 impl SegmentIndexPage {
+    ///Creates new page.
     fn new(max_number_of_records: i32, start_offset: i32, segment_id: i64) -> Self {
         let size = SegmentOffset::size_of_single_record();
         return Self {
@@ -200,6 +226,7 @@ impl SegmentIndexPage {
         };
     }
 
+    ///Loads the page from given bytes.
     fn from_bytes(
         max_number_of_records: i32,
         start_offset: i32,
@@ -215,6 +242,8 @@ impl SegmentIndexPage {
         };
     }
 
+    ///Adds a given SegmentOffset to the page maintaining the sorted order.
+    /// Returns None if page is overflowed.
     fn add_segment_offset(&mut self, offset: &SegmentOffset) -> Option<()> {
         //returns None if page is completely filled.
         let size = SegmentOffset::size_of_single_record();
@@ -286,6 +315,7 @@ impl SegmentIndexPage {
         return Some(());
     }
 
+    /// Performs binary search to find the given message offset, returns None if not found.
     fn get_segment_offset(&self, message_offset: i64) -> Option<SegmentOffset> {
         let size = SegmentOffset::size_of_single_record();
         let mut lo = 0;
@@ -314,6 +344,10 @@ impl SegmentIndexPage {
     }
 }
 
+
+/*
+This struct is responsible for the storing the message offsets and physical offsets in terms of pages of fixed size.
+*/
 #[derive(Debug)]
 struct SegmentIndex {
     segment_id: i64,
@@ -356,6 +390,8 @@ impl SegmentIndex {
         };
     }
 
+
+    /// Returns page starting from given offset.
     fn get_page(
         &self,
         start_offset: i32,
@@ -377,6 +413,7 @@ impl SegmentIndex {
         });
     }
 
+    ///Writes the page to the index file.
     fn write_page(&mut self, page: &SegmentIndexPage) -> Result<(), MessageIOError> {
         let _guard = self
             .index_mutex
@@ -396,6 +433,7 @@ impl SegmentIndex {
         return Ok(());
     }
 
+    ///Returns the latest page which is being written.
     fn get_cnt_page_being_written(
         &self,
         max_number_of_records_in_page: i32,
@@ -484,6 +522,9 @@ impl SegmentIndexPageCache {
     }
 }
 
+/*
+This is segment level struct which manages data insertion and retrieval and provides standard functions to be used at partition level
+*/
 #[derive(Debug)]
 struct SegmentManager {
     segment: Segment,
@@ -516,6 +557,7 @@ impl SegmentManager {
         cache: &mut SegmentIndexPageCache,
         message_offset: i64,
     ) -> Result<(), MessageIOError> {
+        //Adds message to the latest page and updates data in segment file, segment_index file and cache.
         let physical_offset = self.segment.add_message(message)?;
         let offset = SegmentOffset {
             message_offset: message_offset,
@@ -531,6 +573,7 @@ impl SegmentManager {
         return Ok(());
     }
 
+    ///This first tries to get data from cached pages. If no cached pages has the required offset, it moves to not cached pages, and goes through all of them until required offset is found.
     fn get_message(
         &self,
         message_offset: i64,
