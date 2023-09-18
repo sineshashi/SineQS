@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
+use std::ops::Deref;
 use std::os::windows::prelude::FileExt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
@@ -41,7 +42,7 @@ struct Message {
 
 impl Message {
     /*
-    returns current message length 
+    returns current message length
     */
     fn size(&self) -> usize {
         return self.message_bytes.len();
@@ -149,7 +150,6 @@ impl Segment {
     }
 }
 
-
 /*
 This struct stores a unique id of messages which is message offset and the physical offset of message provided by `Segment` struct.
 */
@@ -242,66 +242,87 @@ impl SegmentIndexPage {
         let length = ((hi + 1) * size) as usize;
         let last_message_offset_res =
             SegmentOffset::from_bytes(&self.bytes[length - size as usize..]);
-        if last_message_offset_res.is_some() {
-            return None;
-        }
-        let mut idx: Option<i32> = None;
+        let mut insertion_idx = None;
+        let mut inplace = false;
+
         while lo <= hi {
-            let mid = (lo + hi) / 2;
-            let start_offset = (mid * size) as usize;
-            let msg_offset_opt =
-                SegmentOffset::from_bytes(&self.bytes[start_offset..start_offset + size as usize]);
-            let pre_msg_offset_opt;
-            if lo != mid {
-                pre_msg_offset_opt = SegmentOffset::from_bytes(
-                    &self.bytes[start_offset - size as usize..start_offset],
+            let mid = (lo + hi)/2;
+            let mid_offset = SegmentOffset::from_bytes(
+                &self.bytes[(mid as usize)*(size as usize)..(mid as usize + 1)*(size as usize)]
+            );
+            let pre_mid_offset;
+            if mid != 0 {
+                pre_mid_offset = SegmentOffset::from_bytes(
+                    &self.bytes[(mid as usize - 1)*(size as usize)..(mid as usize)*(size as usize)]
                 );
             } else {
-                if msg_offset_opt.as_ref().is_none() {
-                    idx = Some(mid);
-                    break;
-                }
-                pre_msg_offset_opt = None;
-            }
-            if pre_msg_offset_opt.as_ref().is_none() && msg_offset_opt.as_ref().is_none() {
-                if mid - 1 == 0 {
-                    idx = Some(0);
+                pre_mid_offset = None;
+            };
+            if mid_offset.as_ref().is_none() && pre_mid_offset.as_ref().is_none() {
+                if mid == 0 {
+                    insertion_idx = Some(0);
                     break;
                 } else {
                     hi = mid - 1;
                 }
-            } else if msg_offset_opt.as_ref().is_none() {
-                if pre_msg_offset_opt
-                    .as_ref()
-                    .is_some_and(|x| x.message_offset < offset.message_offset)
-                {
-                    idx = Some(mid);
+            } else if mid_offset.as_ref().is_some() && pre_mid_offset.as_ref().is_none() {
+                if mid_offset.as_ref().unwrap().message_offset == offset.message_offset {
+                    insertion_idx = Some(mid);
+                    inplace = true;
+                    break;
+                } else if mid_offset.as_ref().unwrap().message_offset > offset.message_offset {
+                    insertion_idx = Some(mid);
+                    break;
+                } else {
+                    lo = mid + 1;
+                }
+            } else if mid_offset.as_ref().is_none() && pre_mid_offset.as_ref().is_some() {
+                if pre_mid_offset.as_ref().unwrap().message_offset == offset.message_offset {
+                    insertion_idx = Some(mid-1);
+                    inplace = true;
+                    break;
+                } else if pre_mid_offset.as_ref().unwrap().message_offset < offset.message_offset {
+                    insertion_idx = Some(mid);
                     break;
                 } else {
                     hi = mid - 1;
                 }
             } else {
-                let mid_val = msg_offset_opt.as_ref().unwrap().message_offset;
-                let premid_val = msg_offset_opt.as_ref().unwrap().message_offset;
-                if offset.message_offset < mid_val && offset.message_offset > premid_val {
-                    idx = Some(mid);
+                if mid_offset.as_ref().unwrap().message_offset == offset.message_offset {
+                    insertion_idx = Some(mid);
+                    inplace = true;
                     break;
-                } else if offset.message_offset < mid_val && offset.message_offset < premid_val {
-                    lo = mid + 1;
-                } else {
+                } else if pre_mid_offset.as_ref().unwrap().message_offset == offset.message_offset {
+                    insertion_idx = Some(mid-1);
+                    inplace = true;
+                    break;
+                } else if pre_mid_offset.as_ref().unwrap().message_offset < offset.message_offset && offset.message_offset < mid_offset.as_ref().unwrap().message_offset {
+                    insertion_idx = Some(mid);
+                    break;
+                } else if pre_mid_offset.as_ref().unwrap().message_offset > offset.message_offset {
                     hi = mid - 1;
+                } else {
+                    lo = mid + 1;
                 }
             }
-        }
-        let i = idx.unwrap();
+        };
+        let i = insertion_idx.unwrap();
         let write_offset = i * size;
-        let after_bytes = &self.bytes[write_offset as usize..length - size as usize];
-        let pre_bytes = &self.bytes[0..write_offset as usize];
-        let mut bytes = vec![];
-        bytes.extend_from_slice(pre_bytes);
-        bytes.extend_from_slice(&offset.to_bytes());
-        bytes.extend_from_slice(&after_bytes);
-        self.bytes = bytes;
+        if !inplace && last_message_offset_res.as_ref().is_some() {
+            return None;
+        };
+        if !inplace {
+            let after_bytes = &self.bytes[write_offset as usize..length - size as usize];
+            let pre_bytes = &self.bytes[0..write_offset as usize];
+            let mut bytes = vec![];
+            bytes.extend_from_slice(pre_bytes);
+            bytes.extend_from_slice(&offset.to_bytes());
+            bytes.extend_from_slice(&after_bytes);
+            self.bytes = bytes;
+        } else {
+            self.bytes[write_offset as usize..write_offset as usize + size as usize]
+                .copy_from_slice(&offset.to_bytes());
+        }
         return Some(());
     }
 
@@ -333,7 +354,6 @@ impl SegmentIndexPage {
         return None;
     }
 }
-
 
 /*
 This struct is responsible for the storing the message offsets and physical offsets in terms of pages of fixed size.
@@ -379,7 +399,6 @@ impl SegmentIndex {
             index_mutex: Mutex::new(()),
         };
     }
-
 
     /// Returns page starting from given offset.
     fn get_page(
@@ -536,7 +555,7 @@ impl SegmentManager {
         return Self {
             segment: Segment::new(segment_id, String::from(&folder), active),
             segment_index: segment_index,
-            cnt_index_page: cnt_index_page
+            cnt_index_page: cnt_index_page,
         };
     }
 
@@ -550,11 +569,17 @@ impl SegmentManager {
         let physical_offset = self.segment.add_message(message)?;
         let offset = SegmentOffset {
             message_offset: message_offset,
-            physical_offset: physical_offset
+            physical_offset: physical_offset,
         };
         let res = self.cnt_index_page.add_segment_offset(&offset);
         if res.is_none() {
-            self.cnt_index_page = SegmentIndexPage::new(self.cnt_index_page.max_number_of_records, self.cnt_index_page.start_offset + self.cnt_index_page.max_number_of_records * SegmentOffset::size_of_single_record(), self.segment.segment_id);
+            self.cnt_index_page = SegmentIndexPage::new(
+                self.cnt_index_page.max_number_of_records,
+                self.cnt_index_page.start_offset
+                    + self.cnt_index_page.max_number_of_records
+                        * SegmentOffset::size_of_single_record(),
+                self.segment.segment_id,
+            );
             self.cnt_index_page.add_segment_offset(&offset);
         };
         self.segment_index.write_page(&self.cnt_index_page)?;
@@ -566,41 +591,52 @@ impl SegmentManager {
     fn get_message(
         &self,
         message_offset: i64,
-        cache: &mut SegmentIndexPageCache
+        cache: &mut SegmentIndexPageCache,
     ) -> Result<Option<Message>, MessageIOError> {
         //First tries all the pages of given segment in cache.
         //If not found then tries to find in the whole segment page by page.
         let mut set = HashSet::new();
-        let page_offsets = cache.get_page_offsets_of_segment(self.segment.segment_id);
+        let mut page_offsets = cache.get_page_offsets_of_segment(self.segment.segment_id);
+        page_offsets.sort_by(|a, b| b.cmp(a));
         for poffset in page_offsets {
             let mut page = cache.get(self.segment.segment_id, poffset)?;
             if page.as_ref().is_none() {
-                page = Some(self.segment_index.get_page(poffset, self.cnt_index_page.max_number_of_records)?);
+                page = Some(
+                    self.segment_index
+                        .get_page(poffset, self.cnt_index_page.max_number_of_records)?,
+                );
                 cache.set(page.clone().unwrap())?;
             };
             let offset = page.unwrap().get_segment_offset(message_offset);
             if offset.as_ref().is_some() {
-                return Ok(Some(self.segment.read_message(offset.unwrap().physical_offset)?));
+                return Ok(Some(
+                    self.segment.read_message(offset.unwrap().physical_offset)?,
+                ));
             }
             set.insert(poffset);
         }
         let number_of_bytes = self.segment_index.number_of_bytes;
-        let page_size = self.cnt_index_page.max_number_of_records * SegmentOffset::size_of_single_record();
-        for i in 0..((number_of_bytes as f64/page_size as f64).ceil() as i32) {
-            let poffset = i*page_size;
+        let page_size =
+            self.cnt_index_page.max_number_of_records * SegmentOffset::size_of_single_record();
+        for i in (0..=((number_of_bytes as f64 / page_size as f64).ceil() as i32)).rev() {
+            let poffset = i * page_size;
             if set.contains(&poffset) {
-                continue
+                continue;
             } else {
                 set.insert(poffset);
             }
-            let page = self.segment_index.get_page(poffset, self.cnt_index_page.max_number_of_records)?;
+            let page = self
+                .segment_index
+                .get_page(poffset, self.cnt_index_page.max_number_of_records)?;
             cache.set(page.clone())?;
             let offset = page.get_segment_offset(message_offset);
             if offset.as_ref().is_some() {
-                return Ok(Some(self.segment.read_message(offset.unwrap().physical_offset)?));
+                return Ok(Some(
+                    self.segment.read_message(offset.unwrap().physical_offset)?,
+                ));
             }
         }
-        return Ok(None)
+        return Ok(None);
     }
 }
 
@@ -659,19 +695,34 @@ mod SegmentTests {
 
     #[test]
     fn test_segment_manager() {
-        let mut manager = SegmentManager::new(1, String::from("./data"), true, 16);
+        let mut manager = SegmentManager::new(1, String::from("./data"), true, 1);
         let mut cache = SegmentIndexPageCache::new(100);
         let bytes = "I am Shashi Kant.".as_bytes().to_owned().to_vec();
-        let message = Message{message_bytes: bytes};
-        let r = manager.add_message(
-            message,
-            &mut cache,
-            1
-        );
+        let message = Message {
+            message_bytes: bytes,
+        };
+        let r = manager.add_message(message, &mut cache, 1);
         assert!(r.is_ok_and(|_| {
             let res = manager.get_message(1, &mut cache);
             res.is_ok_and(|y| {
-                y.is_some_and(|z| std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant.")
+                y.is_some_and(|z| {
+                    std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant."
+                })
+            })
+        }));
+
+        let bytes = "I am Shashi Kant the Dev.".as_bytes().to_owned().to_vec();
+        let message = Message {
+            message_bytes: bytes,
+        };
+        let r = manager.add_message(message, &mut cache, 1);
+        assert!(r.is_ok_and(|_| {
+            let res = manager.get_message(1, &mut cache);
+            res.is_ok_and(|y| {
+                y.is_some_and(|z| {
+                    println!("{:?}", std::str::from_utf8(&z.message_bytes).unwrap());
+                    std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant the Dev."
+                })
             })
         }));
     }
