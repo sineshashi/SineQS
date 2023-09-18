@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use core::num;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -183,13 +184,13 @@ impl SegmentOffset {
 #[derive(Debug, Clone)]
 struct SegmentIndexPage {
     start_offset: i32,
-    segment_id: i32,
+    segment_id: i64,
     max_number_of_records: i32,
     bytes: Vec<u8>,
 }
 
 impl SegmentIndexPage {
-    fn new(max_number_of_records: i32, start_offset: i32, segment_id: i32) -> Self {
+    fn new(max_number_of_records: i32, start_offset: i32, segment_id: i64) -> Self {
         let size = SegmentOffset::size_of_single_record();
         return Self {
             max_number_of_records: max_number_of_records,
@@ -202,7 +203,7 @@ impl SegmentIndexPage {
     fn from_bytes(
         max_number_of_records: i32,
         start_offset: i32,
-        segment_id: i32,
+        segment_id: i64,
         bytes: Vec<u8>,
     ) -> Self {
         let size = SegmentOffset::size_of_single_record() as usize;
@@ -215,6 +216,7 @@ impl SegmentIndexPage {
     }
 
     fn add_segment_offset(&mut self, offset: &SegmentOffset) -> Option<()> {
+        //returns None if page is completely filled.
         let size = SegmentOffset::size_of_single_record();
         let mut lo = 0;
         let mut hi = self.max_number_of_records - 1;
@@ -314,7 +316,7 @@ impl SegmentIndexPage {
 
 #[derive(Debug)]
 struct SegmentIndex {
-    segment_id: i32,
+    segment_id: i64,
     file: String,
     active: bool,
     write_handler: Option<File>,
@@ -323,12 +325,13 @@ struct SegmentIndex {
 }
 
 impl SegmentIndex {
-    fn new(segment_id: i32, folder: String, active: bool) -> Self {
+    fn new(segment_id: i64, folder: String, active: bool) -> Self {
         let file = format!("{}/{}.index", folder, segment_id);
         let write_handler;
         if active {
             write_handler = Some(
                 OpenOptions::new()
+                    .create(true)
                     .write(true)
                     .read(true)
                     .open(String::from(&file))
@@ -389,7 +392,19 @@ impl SegmentIndex {
             .unwrap()
             .seek_write(&page.bytes, page.start_offset as u64)?;
         self.write_handler.as_ref().unwrap().flush()?;
+        self.number_of_bytes += &page.bytes.len();
         return Ok(());
+    }
+
+    fn get_cnt_page_being_written(
+        &self,
+        max_number_of_records_in_page: i32,
+    ) -> Result<SegmentIndexPage, MessageIOError> {
+        let size = SegmentOffset::size_of_single_record();
+        let page_size = size * max_number_of_records_in_page;
+        let number_of_pages = self.number_of_bytes as i32 / page_size;
+        let start_offset = number_of_pages * page_size;
+        return self.get_page(start_offset, max_number_of_records_in_page);
     }
 }
 
@@ -399,7 +414,7 @@ A simple index page cache implementation which uses only hashmap. Later more gre
 
 #[derive(Debug)]
 struct SegmentIndexPageCache {
-    store: Arc<RwLock<HashMap<i32, HashMap<i32, SegmentIndexPage>>>>,
+    store: Arc<RwLock<HashMap<i64, HashMap<i32, SegmentIndexPage>>>>,
     max_pages_to_store: i32,
     current_number_of_pages: i32,
 }
@@ -419,23 +434,24 @@ impl SegmentIndexPageCache {
 
     fn get(
         &self,
-        segment_id: i32,
+        segment_id: i64,
         page_offset: i32,
     ) -> Result<Option<SegmentIndexPage>, MessageIOError> {
         let store = self
             .store
             .read()
             .map_err(|x| MessageIOError::CustomError(format!("Poisened Lock {:?}", x)))?;
-        match store.get(&segment_id).map(
-            |x| x.get(&page_offset).cloned()
-        ) {
+        match store.get(&segment_id).map(|x| x.get(&page_offset).cloned()) {
             Some(v) => Ok(v),
-            None => Ok(None)
+            None => Ok(None),
         }
     }
 
-    fn set(&mut self, page: SegmentIndexPage) -> Result<Option<SegmentIndexPage>, MessageIOError>{
-        let mut store = self.store.write().map_err(|x| MessageIOError::CustomError(format!("Poisened Lock {:?}", x)))?;
+    fn set(&mut self, page: SegmentIndexPage) -> Result<Option<SegmentIndexPage>, MessageIOError> {
+        let mut store = self
+            .store
+            .write()
+            .map_err(|x| MessageIOError::CustomError(format!("Poisened Lock {:?}", x)))?;
         match store.get_mut(&page.segment_id) {
             Some(v) => match v.insert(page.start_offset, page) {
                 Some(val) => {
@@ -455,7 +471,7 @@ impl SegmentIndexPageCache {
         }
     }
 
-    fn get_page_offsets_of_segment(&mut self, segment_id: i32) -> Vec<i32> {
+    fn get_page_offsets_of_segment(&mut self, segment_id: i64) -> Vec<i32> {
         let store = self.store.read().ok().unwrap();
         match store.get(&segment_id) {
             Some(h) => {
@@ -468,9 +484,97 @@ impl SegmentIndexPageCache {
     }
 }
 
+#[derive(Debug)]
+struct SegmentManager {
+    segment: Segment,
+    segment_index: SegmentIndex,
+    cnt_index_page: SegmentIndexPage,
+}
+
+impl SegmentManager {
+    fn new(
+        segment_size: i32,
+        segment_id: i64,
+        folder: String,
+        active: bool,
+        max_number_of_records_in_index_page: i32,
+    ) -> Self {
+        let segment_index = SegmentIndex::new(segment_id, String::from(&folder), active);
+        let cnt_index_page = segment_index
+            .get_cnt_page_being_written(max_number_of_records_in_index_page)
+            .expect("Latest index page could not be loaded.");
+        return Self {
+            segment: Segment::new(segment_size, segment_id, String::from(&folder), active),
+            segment_index: segment_index,
+            cnt_index_page: cnt_index_page
+        };
+    }
+
+    fn add_message(
+        &mut self,
+        message: Message,
+        cache: &mut SegmentIndexPageCache,
+        message_offset: i64,
+    ) -> Result<(), MessageIOError> {
+        let physical_offset = self.segment.add_message(message)?;
+        let offset = SegmentOffset {
+            message_offset: message_offset,
+            physical_offset: physical_offset
+        };
+        let res = self.cnt_index_page.add_segment_offset(&offset);
+        if res.is_none() {
+            self.cnt_index_page = SegmentIndexPage::new(self.cnt_index_page.max_number_of_records, self.cnt_index_page.start_offset + self.cnt_index_page.max_number_of_records * SegmentOffset::size_of_single_record(), self.segment.segment_id);
+            self.cnt_index_page.add_segment_offset(&offset);
+        };
+        self.segment_index.write_page(&self.cnt_index_page)?;
+        cache.set(self.cnt_index_page.clone())?;
+        return Ok(());
+    }
+
+    fn get_message(
+        &self,
+        message_offset: i64,
+        cache: &mut SegmentIndexPageCache
+    ) -> Result<Option<Message>, MessageIOError> {
+        //First tries all the pages of given segment in cache.
+        //If not found then tries to find in the whole segment page by page.
+        let mut set = HashSet::new();
+        let page_offsets = cache.get_page_offsets_of_segment(self.segment.segment_id);
+        for poffset in page_offsets {
+            let mut page = cache.get(self.segment.segment_id, poffset)?;
+            if page.as_ref().is_none() {
+                page = Some(self.segment_index.get_page(poffset, self.cnt_index_page.max_number_of_records)?);
+                cache.set(page.clone().unwrap())?;
+            };
+            let offset = page.unwrap().get_segment_offset(message_offset);
+            if offset.as_ref().is_some() {
+                return Ok(Some(self.segment.read_message(offset.unwrap().physical_offset)?));
+            }
+            set.insert(poffset);
+        }
+        let number_of_bytes = self.segment_index.number_of_bytes;
+        let page_size = self.cnt_index_page.max_number_of_records * SegmentOffset::size_of_single_record();
+        for i in 0..((number_of_bytes as f64/page_size as f64).ceil() as i32) {
+            let poffset = i*page_size;
+            if set.contains(&poffset) {
+                continue
+            } else {
+                set.insert(poffset);
+            }
+            let page = self.segment_index.get_page(poffset, self.cnt_index_page.max_number_of_records)?;
+            cache.set(page.clone())?;
+            let offset = page.get_segment_offset(message_offset);
+            if offset.as_ref().is_some() {
+                return Ok(Some(self.segment.read_message(offset.unwrap().physical_offset)?));
+            }
+        }
+        return Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod SegmentTests {
-    use crate::{Message, Segment, SegmentIndexPage, SegmentIndexPageCache};
+    use crate::{Message, Segment, SegmentIndexPage, SegmentIndexPageCache, SegmentManager};
     #[test]
     fn test_segment_functions() {
         let mut segment = Segment::new(8196, 1, String::from("."), true);
@@ -517,8 +621,27 @@ mod SegmentTests {
         assert!(again_null.is_ok_and(|x| x.is_none()));
         let should_not_be_null = cache.get(1, 0);
         assert!(should_not_be_null.is_ok_and(
-            |x| x.is_some_and(|x| { x.segment_id == 1 && x.max_number_of_records == 5 }))
+            |x| x.is_some_and(|x| { x.segment_id == 1 && x.max_number_of_records == 5 })
+        ));
+    }
+
+    #[test]
+    fn test_segment_manager() {
+        let mut manager = SegmentManager::new(8196, 1, String::from("./data"), true, 16);
+        let mut cache = SegmentIndexPageCache::new(100);
+        let bytes = "I am Shashi Kant.".as_bytes().to_owned().to_vec();
+        let message = Message{message_bytes: bytes};
+        let r = manager.add_message(
+            message,
+            &mut cache,
+            1
         );
+        assert!(r.is_ok_and(|_| {
+            let res = manager.get_message(1, &mut cache);
+            res.is_ok_and(|y| {
+                y.is_some_and(|z| std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant.")
+            })
+        }));
     }
 }
 
