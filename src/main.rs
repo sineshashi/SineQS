@@ -1,17 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 use std::ops::Deref;
 use std::os::windows::prelude::FileExt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::{fmt, fs};
 
 #[derive(Debug)]
 enum MessageIOError {
     SegmentOverFlow(String),
     IOError(std::io::Error),
     CustomError(String),
+    PartitionOverFlow(String)
 }
 
 impl Error for MessageIOError {}
@@ -19,9 +20,10 @@ impl Error for MessageIOError {}
 impl fmt::Display for MessageIOError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            MessageIOError::SegmentOverFlow(msg) => write!(f, "SegmentOverFlow: {}", msg),
-            MessageIOError::IOError(msg) => write!(f, "IOError: {:?}", msg),
-            Self::CustomError(msg) => writeln!(f, "Cusom Error {:?}", msg),
+            Self::SegmentOverFlow(msg) => write!(f, "SegmentOverFlow: {}", msg),
+            Self::IOError(msg) => write!(f, "IOError: {:?}", msg),
+            Self::CustomError(msg) => writeln!(f, "Custom Error {:?}", msg),
+            Self::PartitionOverFlow(msg) => writeln!(f, "Partition Over Flow Error {:?}", msg),
         }
     }
 }
@@ -86,11 +88,8 @@ impl Segment {
         } else {
             write_handler = None;
         };
-        let read = OpenOptions::new()
-            .read(true)
-            .open(String::from(&file))
-            .expect(&format!("Could not open file segment {}", &file));
-        let number_of_bytes = read.bytes().count();
+        let metadata = fs::metadata(String::from(&file)).expect("Could not load file");
+        let number_of_bytes = metadata.len();
         Self {
             segment_id: segment_id,
             file: file,
@@ -99,6 +98,11 @@ impl Segment {
             number_of_bytes: number_of_bytes as i32,
             segment_mutex: Mutex::new(()),
         }
+    }
+
+    fn deactivate(&mut self) {
+        self.active = false;
+        self.write_handler = None;
     }
 
     //Writes the message if space is available and returns the starting offset of the message which should be stored in the index.
@@ -392,15 +396,21 @@ impl SegmentIndex {
             .write(false)
             .open(String::from(&file))
             .expect(&format!("Could not open file {}", &file));
-        let number_of_bytes = read.bytes().count();
+        let metadata = fs::metadata(String::from(&file)).expect("Could not load file");
+        let number_of_bytes = metadata.len();
         return Self {
             segment_id: segment_id,
             file: file,
             active: true,
             write_handler: write_handler,
-            number_of_bytes: number_of_bytes,
+            number_of_bytes: number_of_bytes as usize,
             index_mutex: Mutex::new(()),
         };
+    }
+
+    fn deactivate(&mut self) {
+        self.active = false;
+        self.write_handler = None;
     }
 
     /// Returns page starting from given offset.
@@ -541,7 +551,7 @@ This is segment level struct which manages data insertion and retrieval and prov
 struct SegmentManager {
     segment: Segment,
     segment_index: SegmentIndex,
-    cnt_index_page: SegmentIndexPage,
+    cnt_index_page: Option<SegmentIndexPage>,
 }
 
 impl SegmentManager {
@@ -552,14 +562,27 @@ impl SegmentManager {
         max_number_of_records_in_index_page: i32,
     ) -> Self {
         let segment_index = SegmentIndex::new(segment_id, String::from(&folder), active);
-        let cnt_index_page = segment_index
-            .get_cnt_page_being_written(max_number_of_records_in_index_page)
-            .expect("Latest index page could not be loaded.");
+        let cnt_index_page;
+        if active {
+            cnt_index_page = Some(
+                segment_index
+                    .get_cnt_page_being_written(max_number_of_records_in_index_page)
+                    .expect("Latest index page could not be loaded."),
+            );
+        } else {
+            cnt_index_page = None
+        }
         return Self {
             segment: Segment::new(segment_id, String::from(&folder), active),
             segment_index: segment_index,
             cnt_index_page: cnt_index_page,
         };
+    }
+
+    fn deactivate(&mut self) {
+        self.segment.deactivate();
+        self.segment_index.deactivate();
+        self.cnt_index_page = None;
     }
 
     fn add_message(
@@ -574,19 +597,27 @@ impl SegmentManager {
             message_offset: message_offset,
             physical_offset: physical_offset,
         };
-        let res = self.cnt_index_page.add_segment_offset(&offset);
+        let res = self
+            .cnt_index_page
+            .as_mut()
+            .unwrap()
+            .add_segment_offset(&offset);
         if res.is_none() {
-            self.cnt_index_page = SegmentIndexPage::new(
-                self.cnt_index_page.max_number_of_records,
-                self.cnt_index_page.start_offset
-                    + self.cnt_index_page.max_number_of_records
+            self.cnt_index_page = Some(SegmentIndexPage::new(
+                self.cnt_index_page.as_ref().unwrap().max_number_of_records,
+                self.cnt_index_page.as_ref().unwrap().start_offset
+                    + self.cnt_index_page.as_ref().unwrap().max_number_of_records
                         * SegmentOffset::size_of_single_record(),
                 self.segment.segment_id,
-            );
-            self.cnt_index_page.add_segment_offset(&offset);
+            ));
+            self.cnt_index_page
+                .as_mut()
+                .unwrap()
+                .add_segment_offset(&offset);
         };
-        self.segment_index.write_page(&self.cnt_index_page)?;
-        cache.set(self.cnt_index_page.clone())?;
+        self.segment_index
+            .write_page(&self.cnt_index_page.as_ref().unwrap())?;
+        cache.set(self.cnt_index_page.clone().unwrap())?;
         return Ok(());
     }
 
@@ -604,10 +635,10 @@ impl SegmentManager {
         for poffset in page_offsets {
             let mut page = cache.get(self.segment.segment_id, poffset)?;
             if page.as_ref().is_none() {
-                page = Some(
-                    self.segment_index
-                        .get_page(poffset, self.cnt_index_page.max_number_of_records)?,
-                );
+                page = Some(self.segment_index.get_page(
+                    poffset,
+                    self.cnt_index_page.as_ref().unwrap().max_number_of_records,
+                )?);
                 cache.set(page.clone().unwrap())?;
             };
             let offset = page.unwrap().get_segment_offset(message_offset);
@@ -619,8 +650,8 @@ impl SegmentManager {
             set.insert(poffset);
         }
         let number_of_bytes = self.segment_index.number_of_bytes;
-        let page_size =
-            self.cnt_index_page.max_number_of_records * SegmentOffset::size_of_single_record();
+        let page_size = self.cnt_index_page.as_ref().unwrap().max_number_of_records
+            * SegmentOffset::size_of_single_record();
         for i in (0..=((number_of_bytes as f64 / page_size as f64).ceil() as i32)).rev() {
             let poffset = i * page_size;
             if set.contains(&poffset) {
@@ -628,9 +659,10 @@ impl SegmentManager {
             } else {
                 set.insert(poffset);
             }
-            let page = self
-                .segment_index
-                .get_page(poffset, self.cnt_index_page.max_number_of_records)?;
+            let page = self.segment_index.get_page(
+                poffset,
+                self.cnt_index_page.as_ref().unwrap().max_number_of_records,
+            )?;
             cache.set(page.clone())?;
             let offset = page.get_segment_offset(message_offset);
             if offset.as_ref().is_some() {
@@ -681,7 +713,7 @@ impl SegmentRange {
         let mut id_bytes = [0u8; 8];
         start_bytes.copy_from_slice(&bytes[0..8]);
         end_bytes.copy_from_slice(&bytes[8..16]);
-        id_bytes.copy_from_slice(&bytes[16..32]);
+        id_bytes.copy_from_slice(&bytes[16..24]);
         return Self {
             segment_range_start: i64::from_le_bytes(start_bytes),
             segment_range_end: i64::from_le_bytes(end_bytes),
@@ -695,7 +727,7 @@ struct SegmentRangeIndex {
     number_of_rows: i32,
     file: String,
     write_handler: File,
-    index_mutex: Mutex<()>
+    index_mutex: Mutex<()>,
 }
 
 impl SegmentRangeIndex {
@@ -706,17 +738,14 @@ impl SegmentRangeIndex {
             .append(true)
             .open(String::from(&file))
             .expect(&format!("File could not be opened {:?}", &file));
-        let r_file = OpenOptions::new()
-            .read(true)
-            .open(String::from(&file))
-            .expect(&format!("File could not be opened {:?}", &file));
-        let number_of_bytes = r_file.bytes().count() as i32;
+        let metadata = fs::metadata(String::from(&file)).expect("Could not load file");
+        let number_of_bytes = metadata.len() as i32;
         let number_of_rows = number_of_bytes / SegmentRange::size_of_single_record();
         return Self {
             number_of_rows: number_of_rows,
             file: file,
             write_handler: w_file,
-            index_mutex: Mutex::new(())
+            index_mutex: Mutex::new(()),
         };
     }
 
@@ -735,49 +764,244 @@ impl SegmentRangeIndex {
         return Ok(());
     }
 
-    fn find_segment(
-        &self,
-        message_offset: i64
-    ) -> Result<Option<i64>, MessageIOError>{
+    fn find_segment(&self, message_offset: i64) -> Result<Option<i64>, MessageIOError> {
         //returns segment_id if found else None
         let size = SegmentRange::size_of_single_record();
         let mut lo = 0;
-        let mut hi = self.number_of_rows;
+        let mut hi = self.number_of_rows - 1;
         let r_file = OpenOptions::new()
             .read(true)
             .open(String::from(&self.file))?;
         while lo <= hi {
-            let mid = (lo + hi)/2;
+            let mid = (lo + hi) / 2;
             let mut bytes = vec![0u8; size as usize];
             r_file.seek_read(&mut bytes, mid as u64 * size as u64)?;
             let range = SegmentRange::from_bytes(&bytes);
-            if range.segment_range_start <= message_offset && message_offset <= range.segment_range_end {
+            if range.segment_range_start <= message_offset
+                && message_offset <= range.segment_range_end
+            {
                 return Ok(Some(range.segment_id));
             } else if message_offset < range.segment_range_start {
                 hi = mid - 1;
             } else {
                 lo = mid + 1;
             }
-        };
+        }
         return Ok(None);
+    }
+
+    fn get_first(&self) -> Result<Option<SegmentRange>, MessageIOError> {
+        //None means empty.
+        if self.number_of_rows == 0 {
+            return Ok(None);
+        } else {
+            let size = SegmentRange::size_of_single_record();
+            let r_file = OpenOptions::new()
+                .read(true)
+                .open(String::from(&self.file))?;
+            let mut bytes = vec![0u8; size as usize];
+            r_file.seek_read(&mut bytes, 0)?;
+            return Ok(Some(SegmentRange::from_bytes(&bytes)));
+        }
+    }
+
+    fn get_last(&self) -> Result<Option<SegmentRange>, MessageIOError> {
+        if self.number_of_rows == 0 {
+            return Ok(None);
+        } else {
+            let size = SegmentRange::size_of_single_record();
+            let r_file = OpenOptions::new()
+                .read(true)
+                .open(String::from(&self.file))?;
+            let mut bytes = vec![0u8; size as usize];
+            r_file.seek_read(&mut bytes, (self.number_of_rows - 1) as u64 * size as u64)?;
+            return Ok(Some(SegmentRange::from_bytes(&bytes)));
+        }
+    }
+
+    fn get_all(&self) -> Result<Vec<SegmentRange>, MessageIOError> {
+        let size = SegmentRange::size_of_single_record();
+        let r_file = OpenOptions::new()
+            .read(true)
+            .open(String::from(&self.file))?;
+        let mut segments = vec![];
+        for i in 0..self.number_of_rows {
+            let mut bytes = vec![0u8; size as usize];
+            r_file.seek_read(&mut bytes, i as u64 * size as u64)?;
+            segments.push(SegmentRange::from_bytes(&bytes));
+        }
+        return Ok(segments);
     }
 }
 
 #[derive(Debug)]
 struct Partition {
-    partition_id: i32,
+    partition_id: i64,
     cnt_range_start: i64,
     cnt_range_end: i64,
     cnt_msg_offset: i64,
     least_msg_offset: i64,
-    cnt_active_segment_id: i64,
+    cnt_active_segment: SegmentManager,
     folder: String,
-    range_index: SegmentRangeIndex
+    range_index: SegmentRangeIndex,
+    segment_index_page_cache: SegmentIndexPageCache,
+    max_number_of_records_in_index_page: i32,
+    lock: Mutex<()>
+}
+
+impl Partition {
+    fn new(
+        partition_id: i64,
+        folder: String,   
+        cnt_range_start: i64,
+        cnt_range_end: i64,
+        max_number_of_records_in_index_page: i32,
+        max_index_pages_to_cache: i32,
+    ) -> (Self, bool) {
+        //returns instance, boolean which is true if given range is used else existing half filled segmetn will be picked up.
+        let index_file = format!("{}/segment.index", &folder);
+        let mut index = SegmentRangeIndex::new(index_file);
+        let first_segment = index.get_first().map_err(|e| println!("{:?}", e)).unwrap();
+        let latest_segment = index.get_last().map_err(|e| println!("{:?}", e)).unwrap();
+        if !fs::metadata(format!("{}/{}", &folder, partition_id)).is_ok() {
+            fs::create_dir_all(format!("{}/{}", &folder, partition_id))
+                .expect("Unable to create folder.");
+        };
+        if first_segment.as_ref().is_none() || latest_segment.as_ref().is_none() {
+            index
+                .add_segment(1, cnt_range_end, cnt_range_start)
+                .map_err(|e| println!("Could not add range to index {:?}", e))
+                .unwrap();
+            let cnt_segment = SegmentManager::new(
+                1,
+                format!("{}/{}", &folder, partition_id),
+                true,
+                max_number_of_records_in_index_page,
+            );
+            let segment_index_page_cache = SegmentIndexPageCache::new(max_index_pages_to_cache);
+            return (
+                Self {
+                    partition_id: partition_id,
+                    cnt_range_start: cnt_range_start,
+                    cnt_range_end: cnt_range_end,
+                    cnt_msg_offset: cnt_range_start-1,
+                    least_msg_offset: cnt_range_start,
+                    cnt_active_segment: cnt_segment,
+                    folder: folder,
+                    range_index: index,
+                    segment_index_page_cache: segment_index_page_cache,
+                    max_number_of_records_in_index_page: max_number_of_records_in_index_page,
+                    lock: Mutex::new(())
+                },
+                true,
+            );
+        };
+        let cnt_range_start = latest_segment.as_ref().unwrap().segment_range_start;
+        let cnt_range_end = latest_segment.as_ref().unwrap().segment_range_end;
+        let cnt_active_segment_id = latest_segment.as_ref().unwrap().segment_id;
+        let least_message_offset = first_segment.as_ref().unwrap().segment_range_start;
+
+        //Getting cnt segment manager and loading them.
+        let cnt_segment = SegmentManager::new(
+            cnt_active_segment_id,
+            format!("{}/{}", &folder, partition_id),
+            true,
+            max_number_of_records_in_index_page,
+        );
+        let mut segment_index_page_cache = SegmentIndexPageCache::new(max_index_pages_to_cache);
+
+        //calculating the latest message offset of this range which was committed.
+        let mut lo = cnt_range_start;
+        let mut hi = cnt_range_end;
+        let mut cnt_offset = None;
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let msg = cnt_segment.get_message(mid, &mut segment_index_page_cache);
+            if msg.is_ok_and(|x| x.is_some()) {
+                cnt_offset = Some(mid);
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        let offset;
+        if cnt_offset.is_some() {
+            offset = cnt_offset.unwrap();
+        } else {
+            offset = cnt_range_start-1;
+        };
+
+        return (
+            Self {
+                partition_id: partition_id,
+                cnt_range_start: cnt_range_start,
+                cnt_range_end: cnt_range_end,
+                cnt_msg_offset: offset,
+                least_msg_offset: least_message_offset,
+                cnt_active_segment: cnt_segment,
+                folder: folder,
+                range_index: index,
+                segment_index_page_cache: segment_index_page_cache,
+                max_number_of_records_in_index_page: max_number_of_records_in_index_page,
+                lock: Mutex::new(())
+            },
+            false,
+        );
+    }
+
+    fn write_message(&mut self, message: Message) -> Result<i64, MessageIOError> {
+        if self.cnt_msg_offset == self.cnt_range_end {
+            return Err(MessageIOError::PartitionOverFlow(String::from("Partition Over Flow.")));
+        };
+        self.cnt_msg_offset += 1;
+        let msg_offset = self.cnt_msg_offset;
+        self.cnt_active_segment.add_message(message, &mut self.segment_index_page_cache, msg_offset)?;
+        return Ok(msg_offset);
+    }
+
+    fn read_message(&mut self, message_offset: i64) -> Result<Option<Message>, MessageIOError> {
+        let segment_id = self.range_index.find_segment(message_offset)?;
+        if segment_id.as_ref().is_none() {
+            return Ok(None)
+        };
+        let segment_manager = SegmentManager::new(
+            segment_id.unwrap(),
+            format!("{}/{}", &self.folder, &self.partition_id),
+            false,
+            self.max_number_of_records_in_index_page
+        );
+        segment_manager.get_message(message_offset, &mut self.segment_index_page_cache)
+    }
+
+    fn add_new_segment(&mut self, range_start: i64, range_end: i64) -> Result<(), MessageIOError> {
+        let _guard = self.lock.lock().unwrap();
+        let segment_id = self.range_index.find_segment(range_start)?;
+        if segment_id.is_some() {
+            return Ok(())
+        } else {
+            self.cnt_active_segment.deactivate();
+            let segment = SegmentManager::new(
+                self.cnt_active_segment.segment.segment_id+1,
+                format!("{}/{}", &self.folder, &self.partition_id),
+                true,
+                self.max_number_of_records_in_index_page
+            );
+            self.range_index.add_segment(segment.segment.segment_id+1, range_end, range_start)?;
+            self.cnt_active_segment = segment;
+            self.cnt_msg_offset = range_start-1;
+            self.cnt_range_start = range_start;
+            self.cnt_range_end = range_end;
+            return Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
-mod SegmentTests {
-    use crate::{Message, Segment, SegmentIndexPage, SegmentIndexPageCache, SegmentManager};
+mod Tests {
+    use std::sync::Arc;
+
+    use crate::{Message, Segment, SegmentIndexPage, SegmentIndexPageCache, SegmentManager, Partition};
     #[test]
     fn test_segment_functions() {
         let mut segment = Segment::new(1, String::from("."), true);
@@ -860,6 +1084,50 @@ mod SegmentTests {
                 })
             })
         }));
+    }
+
+    #[test]
+    fn test_partition() {
+        let partition_bool = Partition::new(
+            1,
+            String::from("./data"),
+            1,
+            10,
+            5,
+            10
+        );
+        let mut partition = partition_bool.0;
+        let bytes = "I am Shashi Kant.".as_bytes().to_owned().to_vec();
+        let message = Message {
+            message_bytes: bytes,
+        };
+        let r = partition.write_message(message);
+        println!("{:?}", r);
+        assert!(r.is_ok_and(|x| {
+            let res = partition.read_message(x);
+            println!("{:?}", res);
+            res.is_ok_and(|y| {
+                y.is_some_and(|z| {
+                    std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant."
+                })
+            })
+        }));
+        let bytes = "I am Shashi Kant the Dev.".as_bytes().to_owned().to_vec();
+        let message = Message {
+            message_bytes: bytes,
+        };
+        let r = partition.write_message(message);
+        println!("{:?}", r);
+        assert!(r.is_ok_and(|x| {
+            let res = partition.read_message(x);
+            println!("{:?}", res);
+            res.is_ok_and(|y| {
+                y.is_some_and(|z| {
+                    std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant the Dev."
+                })
+            })
+        }));
+
     }
 }
 
