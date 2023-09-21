@@ -19,6 +19,9 @@ Cargo.lock
 /target
 
 #data files
-*/*.dat
-*/*.index
-/*.dat
+**/*.dat
+**/*.index
+**/*.dat
+
+#vs code requires
+/.vscode

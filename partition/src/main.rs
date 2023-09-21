@@ -12,7 +12,7 @@ enum MessageIOError {
     SegmentOverFlow(String),
     IOError(std::io::Error),
     CustomError(String),
-    PartitionOverFlow(String)
+    PartitionOverFlow(String),
 }
 
 impl Error for MessageIOError {}
@@ -157,43 +157,222 @@ impl Segment {
 /*
 This struct stores a unique id of messages which is message offset and the physical offset of message provided by `Segment` struct.
 */
+
+#[derive(Debug, Clone)]
+struct MessageOffsetI64 {
+    offset: i64,
+}
+
+impl MessageOffsetI64 {
+    fn size() -> i32 {
+        return 8;
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        return self.offset.to_le_bytes().into();
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut o_bytes = [0u8; 8];
+        o_bytes.copy_from_slice(&bytes[..8]);
+        let offset = i64::from_le_bytes(o_bytes);
+        if offset == 0 {
+            return None;
+        }
+        return Some(Self { offset: offset });
+    }
+}
+
+impl PartialOrd for MessageOffsetI64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.offset.partial_cmp(&other.offset)
+    }
+}
+
+impl PartialEq for MessageOffsetI64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.offset == other.offset
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConsumerMessageOffset {
+    consumer_group_id: i64,
+    partition_id: i64,
+    topic_id: i64,
+}
+
+impl ConsumerMessageOffset {
+    fn size() -> i32 {
+        return 24;
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![];
+        bytes.extend(self.consumer_group_id.to_le_bytes());
+        bytes.extend(self.partition_id.to_le_bytes());
+        bytes.extend(self.topic_id.to_le_bytes());
+        return bytes;
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut cid_bytes = [0u8; 8];
+        let mut pid_bytes = [0u8; 8];
+        let mut tid_bytes = [0u8; 8];
+        cid_bytes.copy_from_slice(&bytes[0..8]);
+        pid_bytes.copy_from_slice(&bytes[8..16]);
+        tid_bytes.copy_from_slice(&bytes[16..24]);
+        let cgid = i64::from_le_bytes(cid_bytes);
+        if cgid == 0 {
+            return None;
+        }
+        return Some(Self {
+            consumer_group_id: cgid,
+            partition_id: i64::from_le_bytes(pid_bytes),
+            topic_id: i64::from_le_bytes(tid_bytes),
+        });
+    }
+}
+
+impl PartialOrd for ConsumerMessageOffset {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        if self.consumer_group_id < other.consumer_group_id {
+            return Some(std::cmp::Ordering::Less);
+        } else if self.consumer_group_id > other.consumer_group_id {
+            return Some(std::cmp::Ordering::Greater);
+        } else {
+            if self.partition_id < other.partition_id {
+                return Some(std::cmp::Ordering::Less);
+            } else if self.partition_id > other.partition_id {
+                return Some(std::cmp::Ordering::Greater);
+            } else {
+                if self.topic_id < other.topic_id {
+                    return Some(std::cmp::Ordering::Less);
+                } else if self.topic_id > other.topic_id {
+                    return Some(std::cmp::Ordering::Greater);
+                } else {
+                    return Some(std::cmp::Ordering::Equal);
+                }
+            }
+        }
+    }
+}
+
+impl PartialEq for ConsumerMessageOffset {
+    fn eq(&self, other: &Self) -> bool {
+        self.consumer_group_id == other.consumer_group_id
+            && self.partition_id == other.partition_id
+            && self.topic_id == other.topic_id
+    }
+}
+
+#[derive(Debug, Clone)]
+enum MessageOffsetType {
+    I64Offset,
+    ConsumerOffset,
+}
+
+#[derive(Debug, Clone)]
+enum MessageOffset {
+    I64Offset(MessageOffsetI64),
+    ConsumerOffset(ConsumerMessageOffset),
+}
+
+impl MessageOffset {
+    fn size(offset_type: &MessageOffsetType) -> i32 {
+        match offset_type {
+            MessageOffsetType::ConsumerOffset => ConsumerMessageOffset::size(),
+            MessageOffsetType::I64Offset => MessageOffsetI64::size(),
+        }
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::ConsumerOffset(val) => val.to_bytes(),
+            Self::I64Offset(val) => val.to_bytes(),
+        }
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() as i32 == MessageOffsetI64::size() {
+            Some(Self::I64Offset(MessageOffsetI64::from_bytes(bytes)?))
+        } else {
+            Some(Self::ConsumerOffset(ConsumerMessageOffset::from_bytes(
+                bytes,
+            )?))
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::ConsumerOffset(val) => panic!("Called on wrong type."),
+            Self::I64Offset(mut val) => {
+                val.offset += 1;
+                Self::I64Offset(val)
+            }
+        }
+    }
+}
+
+impl PartialOrd for MessageOffset {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match self {
+            Self::ConsumerOffset(val1) => match other {
+                Self::ConsumerOffset(val2) => val1.partial_cmp(val2),
+                Self::I64Offset(_) => None,
+            },
+            Self::I64Offset(val1) => match other {
+                Self::I64Offset(val2) => val1.partial_cmp(val2),
+                Self::ConsumerOffset(_) => None,
+            },
+        }
+    }
+}
+
+impl PartialEq for MessageOffset {
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            Self::ConsumerOffset(val1) => match other {
+                Self::ConsumerOffset(val2) => val1.eq(val2),
+                Self::I64Offset(_) => false,
+            },
+            Self::I64Offset(val1) => match other {
+                Self::I64Offset(val2) => val1.eq(val2),
+                Self::ConsumerOffset(_) => false,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SegmentOffset {
-    message_offset: i64,
+    message_offset: MessageOffset,
     physical_offset: i32,
 }
 
 impl SegmentOffset {
     //Returns the size which will be taken to store the message offset (8 bytes) and physical offset (4 bytes)
-    fn size_of_single_record() -> i32 {
-        return 12;
+    fn size_of_single_record(offset_type: &MessageOffsetType) -> i32 {
+        return MessageOffset::size(offset_type) + 4;
     }
 
     //Returns the byte representation by [message offset bytes, physical offset bytes]
-    fn to_bytes(&self) -> [u8; 12] {
-        let mut bytes = [0u8; 12];
-        bytes[0..8].copy_from_slice(&i64::to_le_bytes(self.message_offset));
-        bytes[8..].copy_from_slice(&i32::to_le_bytes(self.physical_offset));
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.message_offset.to_bytes();
+        bytes.extend(i32::to_le_bytes(self.physical_offset));
         return bytes;
     }
 
     //Loads the message from bytes and returns None if bytes do not represent a valid offset.
     fn from_bytes(bytes: &[u8]) -> Option<Self> {
         //Returns None if bytes are not valid.
-        let mut msg_os_bytes = [0u8; 8];
-        msg_os_bytes.copy_from_slice(&bytes[..8]);
-        let msg_off_set = i64::from_le_bytes(msg_os_bytes);
-        if msg_off_set == 0 {
-            return None;
-        } else {
-            let mut last_bytes = [0u8; 4];
-            last_bytes.copy_from_slice(&bytes[8..]);
-            let physical_offset = i32::from_le_bytes(last_bytes);
-            return Some(Self {
-                message_offset: msg_off_set,
-                physical_offset: physical_offset,
-            });
-        }
+        let mut last_bytes = [0u8; 4];
+        last_bytes.copy_from_slice(&bytes[bytes.len() - 4..]);
+        let physical_offset = i32::from_le_bytes(last_bytes);
+        return Some(Self {
+            message_offset: MessageOffset::from_bytes(&bytes[..bytes.len() - 4])?,
+            physical_offset: physical_offset,
+        });
     }
 }
 
@@ -206,17 +385,24 @@ struct SegmentIndexPage {
     segment_id: i64,
     max_number_of_records: i32,
     bytes: Vec<u8>,
+    offset_type: MessageOffsetType,
 }
 
 impl SegmentIndexPage {
     ///Creates new page.
-    fn new(max_number_of_records: i32, start_offset: i32, segment_id: i64) -> Self {
-        let size = SegmentOffset::size_of_single_record();
+    fn new(
+        max_number_of_records: i32,
+        start_offset: i32,
+        segment_id: i64,
+        offset_type: MessageOffsetType,
+    ) -> Self {
+        let size = SegmentOffset::size_of_single_record(&offset_type);
         return Self {
             max_number_of_records: max_number_of_records,
             start_offset: start_offset,
             bytes: vec![0u8; max_number_of_records as usize * size as usize],
             segment_id: segment_id,
+            offset_type: offset_type,
         };
     }
 
@@ -226,21 +412,44 @@ impl SegmentIndexPage {
         start_offset: i32,
         segment_id: i64,
         bytes: Vec<u8>,
+        offset_type: MessageOffsetType,
     ) -> Self {
-        let size = SegmentOffset::size_of_single_record() as usize;
+        let size = SegmentOffset::size_of_single_record(&offset_type) as usize;
         return Self {
             max_number_of_records: max_number_of_records,
             segment_id: segment_id,
             start_offset: start_offset,
             bytes: bytes,
+            offset_type: offset_type,
         };
     }
 
     ///Adds a given SegmentOffset to the page maintaining the sorted order.
     /// Returns None if page is overflowed.
+    fn get_last_written_segment(&self) -> Option<SegmentOffset> {
+        let size = SegmentOffset::size_of_single_record(&self.offset_type);
+        let mut lo = 0;
+        let mut hi = self.max_number_of_records - 1;
+        let length = ((hi + 1) * size) as usize;
+        let mut ans = None;
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let mid_offset = SegmentOffset::from_bytes(
+                &self.bytes[(mid as usize) * (size as usize)..(mid as usize + 1) * (size as usize)],
+            );
+            if mid_offset.as_ref().is_none() {
+                hi -= 1;
+            } else {
+                ans = mid_offset;
+                lo += 1;
+            }
+        }
+        return ans;
+    }
+
     fn add_segment_offset(&mut self, offset: &SegmentOffset) -> Option<()> {
         //returns None if page is completely filled.
-        let size = SegmentOffset::size_of_single_record();
+        let size = SegmentOffset::size_of_single_record(&self.offset_type);
         let mut lo = 0;
         let mut hi = self.max_number_of_records - 1;
         let length = ((hi + 1) * size) as usize;
@@ -334,8 +543,8 @@ impl SegmentIndexPage {
     }
 
     /// Performs binary search to find the given message offset, returns None if not found.
-    fn get_segment_offset(&self, message_offset: i64) -> Option<SegmentOffset> {
-        let size = SegmentOffset::size_of_single_record();
+    fn get_segment_offset(&self, message_offset: MessageOffset) -> Option<SegmentOffset> {
+        let size = SegmentOffset::size_of_single_record(&self.offset_type);
         let mut lo = 0;
         let mut hi = self.max_number_of_records - 1;
         while lo <= hi {
@@ -373,10 +582,11 @@ struct SegmentIndex {
     write_handler: Option<File>,
     number_of_bytes: usize,
     index_mutex: Mutex<()>,
+    offset_type: MessageOffsetType,
 }
 
 impl SegmentIndex {
-    fn new(segment_id: i64, folder: String, active: bool) -> Self {
+    fn new(segment_id: i64, folder: String, active: bool, offset_type: MessageOffsetType) -> Self {
         let file = format!("{}/{}.index", folder, segment_id);
         let write_handler;
         if active {
@@ -405,6 +615,7 @@ impl SegmentIndex {
             write_handler: write_handler,
             number_of_bytes: number_of_bytes as usize,
             index_mutex: Mutex::new(()),
+            offset_type: offset_type,
         };
     }
 
@@ -419,7 +630,7 @@ impl SegmentIndex {
         start_offset: i32,
         number_of_records: i32,
     ) -> Result<SegmentIndexPage, MessageIOError> {
-        let size = SegmentOffset::size_of_single_record();
+        let size = SegmentOffset::size_of_single_record(&self.offset_type);
         let number_of_bytes = number_of_records * size;
         let mut buf = vec![0u8; number_of_bytes as usize];
         let file = OpenOptions::new()
@@ -432,6 +643,7 @@ impl SegmentIndex {
             segment_id: self.segment_id,
             max_number_of_records: number_of_records,
             bytes: buf,
+            offset_type: self.offset_type.clone(),
         });
     }
 
@@ -460,7 +672,7 @@ impl SegmentIndex {
         &self,
         max_number_of_records_in_page: i32,
     ) -> Result<SegmentIndexPage, MessageIOError> {
-        let size = SegmentOffset::size_of_single_record();
+        let size = SegmentOffset::size_of_single_record(&self.offset_type);
         let page_size = size * max_number_of_records_in_page;
         let number_of_pages = self.number_of_bytes as i32 / page_size;
         let start_offset = number_of_pages * page_size;
@@ -560,8 +772,10 @@ impl SegmentManager {
         folder: String,
         active: bool,
         max_number_of_records_in_index_page: i32,
+        offset_type: MessageOffsetType,
     ) -> Self {
-        let segment_index = SegmentIndex::new(segment_id, String::from(&folder), active);
+        let segment_index =
+            SegmentIndex::new(segment_id, String::from(&folder), active, offset_type);
         let cnt_index_page;
         if active {
             cnt_index_page = Some(
@@ -579,6 +793,13 @@ impl SegmentManager {
         };
     }
 
+    fn get_last_written_segment_in_the_page(&self) -> Option<SegmentOffset> {
+        match &self.cnt_index_page {
+            Some(val) => val.get_last_written_segment(),
+            None => None,
+        }
+    }
+
     fn deactivate(&mut self) {
         self.segment.deactivate();
         self.segment_index.deactivate();
@@ -589,7 +810,7 @@ impl SegmentManager {
         &mut self,
         message: Message,
         cache: &mut SegmentIndexPageCache,
-        message_offset: i64,
+        message_offset: MessageOffset,
     ) -> Result<(), MessageIOError> {
         //Adds message to the latest page and updates data in segment file, segment_index file and cache.
         let physical_offset = self.segment.add_message(message)?;
@@ -607,8 +828,9 @@ impl SegmentManager {
                 self.cnt_index_page.as_ref().unwrap().max_number_of_records,
                 self.cnt_index_page.as_ref().unwrap().start_offset
                     + self.cnt_index_page.as_ref().unwrap().max_number_of_records
-                        * SegmentOffset::size_of_single_record(),
+                        * SegmentOffset::size_of_single_record(&self.segment_index.offset_type),
                 self.segment.segment_id,
+                self.segment_index.offset_type.clone(),
             ));
             self.cnt_index_page
                 .as_mut()
@@ -624,7 +846,7 @@ impl SegmentManager {
     ///This first tries to get data from cached pages. If no cached pages has the required offset, it moves to not cached pages, and goes through all of them until required offset is found.
     fn get_message(
         &self,
-        message_offset: i64,
+        message_offset: MessageOffset,
         cache: &mut SegmentIndexPageCache,
     ) -> Result<Option<Message>, MessageIOError> {
         //First tries all the pages of given segment in cache.
@@ -641,7 +863,7 @@ impl SegmentManager {
                 )?);
                 cache.set(page.clone().unwrap())?;
             };
-            let offset = page.unwrap().get_segment_offset(message_offset);
+            let offset = page.unwrap().get_segment_offset(message_offset.clone());
             if offset.as_ref().is_some() {
                 return Ok(Some(
                     self.segment.read_message(offset.unwrap().physical_offset)?,
@@ -651,7 +873,7 @@ impl SegmentManager {
         }
         let number_of_bytes = self.segment_index.number_of_bytes;
         let page_size = self.cnt_index_page.as_ref().unwrap().max_number_of_records
-            * SegmentOffset::size_of_single_record();
+            * SegmentOffset::size_of_single_record(&self.segment_index.offset_type);
         for i in (0..=((number_of_bytes as f64 / page_size as f64).ceil() as i32)).rev() {
             let poffset = i * page_size;
             if set.contains(&poffset) {
@@ -664,7 +886,7 @@ impl SegmentManager {
                 self.cnt_index_page.as_ref().unwrap().max_number_of_records,
             )?;
             cache.set(page.clone())?;
-            let offset = page.get_segment_offset(message_offset);
+            let offset = page.get_segment_offset(message_offset.clone());
             if offset.as_ref().is_some() {
                 return Ok(Some(
                     self.segment.read_message(offset.unwrap().physical_offset)?,
@@ -681,12 +903,16 @@ This struct denotes the meta data of a segment, where does it start and end.
 #[derive(Debug)]
 struct SegmentRange {
     segment_id: i64,
-    segment_range_start: i64,
-    segment_range_end: i64,
+    segment_range_start: MessageOffset,
+    segment_range_end: MessageOffset,
 }
 
 impl SegmentRange {
-    fn new(segment_id: i64, segment_range_start: i64, segment_range_end: i64) -> Self {
+    fn new(
+        segment_id: i64,
+        segment_range_start: MessageOffset,
+        segment_range_end: MessageOffset,
+    ) -> Self {
         return Self {
             segment_id: segment_id,
             segment_range_end: segment_range_end,
@@ -694,29 +920,28 @@ impl SegmentRange {
         };
     }
 
-    fn size_of_single_record() -> i32 {
+    fn size_of_single_record(offset_type: &MessageOffsetType) -> i32 {
         //All the three, segment_id, start and end are 8 bytes = 64 bit integers.
-        return 24;
+        return 8 + 2*MessageOffset::size(offset_type);
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = vec![0u8; 24];
-        bytes[0..8].copy_from_slice(&i64::to_le_bytes(self.segment_range_start));
-        bytes[8..16].copy_from_slice(&i64::to_le_bytes(self.segment_range_end));
-        bytes[16..24].copy_from_slice(&i64::to_le_bytes(self.segment_id));
+        let mut bytes = vec![];
+        bytes.extend(self.segment_range_start.to_bytes());
+        bytes.extend(self.segment_range_end.to_bytes());
+        bytes.extend(i64::to_le_bytes(self.segment_id));
         return bytes;
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let mut start_bytes = [0u8; 8];
-        let mut end_bytes = [0u8; 8];
+    fn from_bytes(bytes: &[u8], offset_type: &MessageOffsetType) -> Self {
+        let size = MessageOffset::size(offset_type);
         let mut id_bytes = [0u8; 8];
-        start_bytes.copy_from_slice(&bytes[0..8]);
-        end_bytes.copy_from_slice(&bytes[8..16]);
-        id_bytes.copy_from_slice(&bytes[16..24]);
+        id_bytes.copy_from_slice(&bytes[2 * size as usize..]);
         return Self {
-            segment_range_start: i64::from_le_bytes(start_bytes),
-            segment_range_end: i64::from_le_bytes(end_bytes),
+            segment_range_start: MessageOffset::from_bytes(&bytes[0..size as usize])
+                .expect("Could not load segment range start."),
+            segment_range_end: MessageOffset::from_bytes(&bytes[size as usize..2 * size as usize])
+                .expect("Could not load segment range end."),
             segment_id: i64::from_le_bytes(id_bytes),
         };
     }
@@ -731,7 +956,7 @@ struct SegmentRangeIndex {
 }
 
 impl SegmentRangeIndex {
-    fn new(file: String) -> Self {
+    fn new(file: String, offset_type: &MessageOffsetType) -> Self {
         let w_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -740,7 +965,7 @@ impl SegmentRangeIndex {
             .expect(&format!("File could not be opened {:?}", &file));
         let metadata = fs::metadata(String::from(&file)).expect("Could not load file");
         let number_of_bytes = metadata.len() as i32;
-        let number_of_rows = number_of_bytes / SegmentRange::size_of_single_record();
+        let number_of_rows = number_of_bytes / SegmentRange::size_of_single_record(offset_type);
         return Self {
             number_of_rows: number_of_rows,
             file: file,
@@ -752,8 +977,8 @@ impl SegmentRangeIndex {
     fn add_segment(
         &mut self,
         segment_id: i64,
-        segment_range_end: i64,
-        segment_range_start: i64,
+        segment_range_end: MessageOffset,
+        segment_range_start: MessageOffset,
     ) -> Result<(), MessageIOError> {
         let _guard = self.index_mutex.lock().unwrap();
         self.write_handler.write(
@@ -764,9 +989,13 @@ impl SegmentRangeIndex {
         return Ok(());
     }
 
-    fn find_segment(&self, message_offset: i64) -> Result<Option<i64>, MessageIOError> {
+    fn find_segment(
+        &self,
+        message_offset: MessageOffset,
+        offset_type: &MessageOffsetType,
+    ) -> Result<Option<i64>, MessageIOError> {
         //returns segment_id if found else None
-        let size = SegmentRange::size_of_single_record();
+        let size = SegmentRange::size_of_single_record(offset_type);
         let mut lo = 0;
         let mut hi = self.number_of_rows - 1;
         let r_file = OpenOptions::new()
@@ -776,7 +1005,7 @@ impl SegmentRangeIndex {
             let mid = (lo + hi) / 2;
             let mut bytes = vec![0u8; size as usize];
             r_file.seek_read(&mut bytes, mid as u64 * size as u64)?;
-            let range = SegmentRange::from_bytes(&bytes);
+            let range = SegmentRange::from_bytes(&bytes, offset_type);
             if range.segment_range_start <= message_offset
                 && message_offset <= range.segment_range_end
             {
@@ -790,37 +1019,46 @@ impl SegmentRangeIndex {
         return Ok(None);
     }
 
-    fn get_first(&self) -> Result<Option<SegmentRange>, MessageIOError> {
+    fn get_first(
+        &self,
+        offset_type: &MessageOffsetType,
+    ) -> Result<Option<SegmentRange>, MessageIOError> {
         //None means empty.
         if self.number_of_rows == 0 {
             return Ok(None);
         } else {
-            let size = SegmentRange::size_of_single_record();
+            let size = SegmentRange::size_of_single_record(offset_type);
             let r_file = OpenOptions::new()
                 .read(true)
                 .open(String::from(&self.file))?;
             let mut bytes = vec![0u8; size as usize];
             r_file.seek_read(&mut bytes, 0)?;
-            return Ok(Some(SegmentRange::from_bytes(&bytes)));
+            return Ok(Some(SegmentRange::from_bytes(&bytes, offset_type)));
         }
     }
 
-    fn get_last(&self) -> Result<Option<SegmentRange>, MessageIOError> {
+    fn get_last(
+        &self,
+        offset_type: &MessageOffsetType,
+    ) -> Result<Option<SegmentRange>, MessageIOError> {
         if self.number_of_rows == 0 {
             return Ok(None);
         } else {
-            let size = SegmentRange::size_of_single_record();
+            let size = SegmentRange::size_of_single_record(offset_type);
             let r_file = OpenOptions::new()
                 .read(true)
                 .open(String::from(&self.file))?;
             let mut bytes = vec![0u8; size as usize];
             r_file.seek_read(&mut bytes, (self.number_of_rows - 1) as u64 * size as u64)?;
-            return Ok(Some(SegmentRange::from_bytes(&bytes)));
+            return Ok(Some(SegmentRange::from_bytes(&bytes, offset_type)));
         }
     }
 
-    fn get_all(&self) -> Result<Vec<SegmentRange>, MessageIOError> {
-        let size = SegmentRange::size_of_single_record();
+    fn get_all(
+        &self,
+        offset_type: &MessageOffsetType,
+    ) -> Result<Vec<SegmentRange>, MessageIOError> {
+        let size = SegmentRange::size_of_single_record(offset_type);
         let r_file = OpenOptions::new()
             .read(true)
             .open(String::from(&self.file))?;
@@ -828,7 +1066,7 @@ impl SegmentRangeIndex {
         for i in 0..self.number_of_rows {
             let mut bytes = vec![0u8; size as usize];
             r_file.seek_read(&mut bytes, i as u64 * size as u64)?;
-            segments.push(SegmentRange::from_bytes(&bytes));
+            segments.push(SegmentRange::from_bytes(&bytes, offset_type));
         }
         return Ok(segments);
     }
@@ -837,39 +1075,47 @@ impl SegmentRangeIndex {
 #[derive(Debug)]
 struct Partition {
     partition_id: i64,
-    cnt_range_start: i64,
-    cnt_range_end: i64,
-    cnt_msg_offset: i64,
-    least_msg_offset: i64,
+    cnt_range_start: MessageOffset,
+    cnt_range_end: MessageOffset,
+    cnt_msg_offset: Option<MessageOffset>,
+    least_msg_offset: MessageOffset,
     cnt_active_segment: SegmentManager,
     folder: String,
     range_index: SegmentRangeIndex,
     segment_index_page_cache: SegmentIndexPageCache,
     max_number_of_records_in_index_page: i32,
-    lock: Mutex<()>
+    lock: Mutex<()>,
+    offset_type: MessageOffsetType,
 }
 
 impl Partition {
     fn new(
         partition_id: i64,
-        folder: String,   
-        cnt_range_start: i64,
-        cnt_range_end: i64,
+        folder: String,
+        cnt_range_start: MessageOffset,
+        cnt_range_end: MessageOffset,
         max_number_of_records_in_index_page: i32,
         max_index_pages_to_cache: i32,
+        offset_type: MessageOffsetType,
     ) -> (Self, bool) {
         //returns instance, boolean which is true if given range is used else existing half filled segmetn will be picked up.
         let index_file = format!("{}/segment.index", &folder);
-        let mut index = SegmentRangeIndex::new(index_file);
-        let first_segment = index.get_first().map_err(|e| println!("{:?}", e)).unwrap();
-        let latest_segment = index.get_last().map_err(|e| println!("{:?}", e)).unwrap();
+        let mut index = SegmentRangeIndex::new(index_file, &offset_type);
+        let first_segment = index
+            .get_first(&offset_type)
+            .map_err(|e| println!("{:?}", e))
+            .unwrap();
+        let latest_segment = index
+            .get_last(&offset_type)
+            .map_err(|e| println!("{:?}", e))
+            .unwrap();
         if !fs::metadata(format!("{}/{}", &folder, partition_id)).is_ok() {
             fs::create_dir_all(format!("{}/{}", &folder, partition_id))
                 .expect("Unable to create folder.");
         };
         if first_segment.as_ref().is_none() || latest_segment.as_ref().is_none() {
             index
-                .add_segment(1, cnt_range_end, cnt_range_start)
+                .add_segment(1, cnt_range_end.clone(), cnt_range_start.clone())
                 .map_err(|e| println!("Could not add range to index {:?}", e))
                 .unwrap();
             let cnt_segment = SegmentManager::new(
@@ -877,29 +1123,31 @@ impl Partition {
                 format!("{}/{}", &folder, partition_id),
                 true,
                 max_number_of_records_in_index_page,
+                offset_type.clone(),
             );
             let segment_index_page_cache = SegmentIndexPageCache::new(max_index_pages_to_cache);
             return (
                 Self {
                     partition_id: partition_id,
-                    cnt_range_start: cnt_range_start,
+                    cnt_range_start: cnt_range_start.clone(),
                     cnt_range_end: cnt_range_end,
-                    cnt_msg_offset: cnt_range_start-1,
+                    cnt_msg_offset: None,
                     least_msg_offset: cnt_range_start,
                     cnt_active_segment: cnt_segment,
                     folder: folder,
                     range_index: index,
                     segment_index_page_cache: segment_index_page_cache,
                     max_number_of_records_in_index_page: max_number_of_records_in_index_page,
-                    lock: Mutex::new(())
+                    lock: Mutex::new(()),
+                    offset_type: offset_type,
                 },
                 true,
             );
         };
-        let cnt_range_start = latest_segment.as_ref().unwrap().segment_range_start;
-        let cnt_range_end = latest_segment.as_ref().unwrap().segment_range_end;
+        let cnt_range_start = latest_segment.as_ref().unwrap().segment_range_start.clone();
+        let cnt_range_end = latest_segment.as_ref().unwrap().segment_range_end.clone();
         let cnt_active_segment_id = latest_segment.as_ref().unwrap().segment_id;
-        let least_message_offset = first_segment.as_ref().unwrap().segment_range_start;
+        let least_message_offset = first_segment.as_ref().unwrap().segment_range_start.clone();
 
         //Getting cnt segment manager and loading them.
         let cnt_segment = SegmentManager::new(
@@ -907,92 +1155,129 @@ impl Partition {
             format!("{}/{}", &folder, partition_id),
             true,
             max_number_of_records_in_index_page,
+            offset_type.clone(),
         );
-        let mut segment_index_page_cache = SegmentIndexPageCache::new(max_index_pages_to_cache);
+        let segment_index_page_cache = SegmentIndexPageCache::new(max_index_pages_to_cache);
 
         //calculating the latest message offset of this range which was committed.
-        let mut lo = cnt_range_start;
-        let mut hi = cnt_range_end;
-        let mut cnt_offset = None;
-        while lo <= hi {
-            let mid = (lo + hi) / 2;
-            let msg = cnt_segment.get_message(mid, &mut segment_index_page_cache);
-            if msg.is_ok_and(|x| x.is_some()) {
-                cnt_offset = Some(mid);
-                lo = mid + 1;
-            } else {
-                hi = mid - 1;
-            }
-        }
-
-        let offset;
-        if cnt_offset.is_some() {
-            offset = cnt_offset.unwrap();
-        } else {
-            offset = cnt_range_start-1;
-        };
+        let cnt_offset = cnt_segment.get_last_written_segment_in_the_page();
 
         return (
             Self {
                 partition_id: partition_id,
                 cnt_range_start: cnt_range_start,
                 cnt_range_end: cnt_range_end,
-                cnt_msg_offset: offset,
+                cnt_msg_offset: cnt_offset.map(|x| x.message_offset),
                 least_msg_offset: least_message_offset,
                 cnt_active_segment: cnt_segment,
                 folder: folder,
                 range_index: index,
                 segment_index_page_cache: segment_index_page_cache,
                 max_number_of_records_in_index_page: max_number_of_records_in_index_page,
-                lock: Mutex::new(())
+                lock: Mutex::new(()),
+                offset_type: offset_type,
             },
             false,
         );
     }
 
-    fn write_message(&mut self, message: Message) -> Result<i64, MessageIOError> {
-        if self.cnt_msg_offset == self.cnt_range_end {
-            return Err(MessageIOError::PartitionOverFlow(String::from("Partition Over Flow.")));
+    fn write_message(
+        &mut self,
+        message: Message,
+        message_offset: Option<MessageOffset>,
+    ) -> Result<MessageOffset, MessageIOError> {
+        if self
+            .cnt_msg_offset
+            .as_ref()
+            .is_some_and(|x| x >= &self.cnt_range_end)
+        {
+            return Err(MessageIOError::PartitionOverFlow(String::from(
+                "Partition Over Flow.",
+            )));
         };
-        self.cnt_msg_offset += 1;
-        let msg_offset = self.cnt_msg_offset;
-        self.cnt_active_segment.add_message(message, &mut self.segment_index_page_cache, msg_offset)?;
-        return Ok(msg_offset);
+        if message_offset.is_none() {
+            match &self.cnt_msg_offset {
+                Some(val) => {
+                    let v = val.clone().next();
+                    self.cnt_msg_offset = Some(v.clone());
+                    self.cnt_active_segment.add_message(
+                        message,
+                        &mut self.segment_index_page_cache,
+                        v.clone(),
+                    )?;
+                    return Ok(v);
+                }
+                None => {
+                    self.cnt_msg_offset = Some(self.cnt_range_start.clone());
+                    self.cnt_active_segment.add_message(
+                        message,
+                        &mut self.segment_index_page_cache,
+                        self.cnt_range_start.clone(),
+                    )?;
+                    return Ok(self.cnt_range_start.clone());
+                }
+            }
+        } else {
+            self.cnt_msg_offset = message_offset.clone();
+            self.cnt_active_segment.add_message(
+                message,
+                &mut self.segment_index_page_cache,
+                message_offset.clone().unwrap(),
+            )?;
+            return Ok(message_offset.unwrap());
+        }
     }
 
-    fn read_message(&mut self, message_offset: i64) -> Result<Option<Message>, MessageIOError> {
-        let segment_id = self.range_index.find_segment(message_offset)?;
+    fn read_message(
+        &mut self,
+        message_offset: MessageOffset,
+    ) -> Result<Option<Message>, MessageIOError> {
+        let segment_id = self
+            .range_index
+            .find_segment(message_offset.clone(), &self.offset_type)?;
         if segment_id.as_ref().is_none() {
-            return Ok(None)
+            return Ok(None);
         };
         let segment_manager = SegmentManager::new(
             segment_id.unwrap(),
             format!("{}/{}", &self.folder, &self.partition_id),
             false,
-            self.max_number_of_records_in_index_page
+            self.max_number_of_records_in_index_page,
+            self.offset_type.clone(),
         );
         segment_manager.get_message(message_offset, &mut self.segment_index_page_cache)
     }
 
-    fn add_new_segment(&mut self, range_start: i64, range_end: i64) -> Result<(), MessageIOError> {
+    fn add_new_segment(
+        &mut self,
+        range_start: MessageOffset,
+        range_end: MessageOffset,
+    ) -> Result<(), MessageIOError> {
         let _guard = self.lock.lock().unwrap();
-        let segment_id = self.range_index.find_segment(range_start)?;
+        let segment_id = self
+            .range_index
+            .find_segment(range_start.clone(), &self.offset_type)?;
         if segment_id.is_some() {
-            return Ok(())
+            return Ok(());
         } else {
             self.cnt_active_segment.deactivate();
             let segment = SegmentManager::new(
-                self.cnt_active_segment.segment.segment_id+1,
+                self.cnt_active_segment.segment.segment_id + 1,
                 format!("{}/{}", &self.folder, &self.partition_id),
                 true,
-                self.max_number_of_records_in_index_page
+                self.max_number_of_records_in_index_page,
+                self.offset_type.clone(),
             );
-            self.range_index.add_segment(segment.segment.segment_id+1, range_end, range_start)?;
+            self.range_index.add_segment(
+                segment.segment.segment_id + 1,
+                range_end.clone(),
+                range_start.clone(),
+            )?;
             self.cnt_active_segment = segment;
-            self.cnt_msg_offset = range_start-1;
+            self.cnt_msg_offset = None;
             self.cnt_range_start = range_start;
             self.cnt_range_end = range_end;
-            return Ok(())
+            return Ok(());
         }
     }
 }
@@ -1001,7 +1286,9 @@ impl Partition {
 mod Tests {
     use std::sync::Arc;
 
-    use crate::{Message, Segment, SegmentIndexPage, SegmentIndexPageCache, SegmentManager, Partition};
+    use crate::{
+        Message, Partition, Segment, SegmentIndexPage, SegmentIndexPageCache, SegmentManager,
+    };
     #[test]
     fn test_segment_functions() {
         let mut segment = Segment::new(1, String::from("."), true);
@@ -1026,13 +1313,16 @@ mod Tests {
 
     #[test]
     fn test_segment_index_page() {
-        let mut page = SegmentIndexPage::new(100, 0, 1);
+        let mut page = SegmentIndexPage::new(100, 0, 1, crate::MessageOffsetType::I64Offset);
         let segment = crate::SegmentOffset {
-            message_offset: 1,
+            message_offset: crate::MessageOffset::I64Offset(crate::MessageOffsetI64 { offset: 1 }),
             physical_offset: 1,
         };
         page.add_segment_offset(&segment);
-        let searched_segment = page.get_segment_offset(1);
+        let searched_segment =
+            page.get_segment_offset(crate::MessageOffset::I64Offset(crate::MessageOffsetI64 {
+                offset: 1,
+            }));
         assert!(
             searched_segment.is_some_and(|o| o.message_offset == segment.message_offset
                 && o.physical_offset == segment.physical_offset)
@@ -1044,7 +1334,12 @@ mod Tests {
         let mut cache = SegmentIndexPageCache::new(5);
         let should_be_null = cache.get(1, 0);
         assert!(should_be_null.is_ok_and(|x| x.is_none()));
-        let again_null = cache.set(SegmentIndexPage::new(5, 0, 1));
+        let again_null = cache.set(SegmentIndexPage::new(
+            5,
+            0,
+            1,
+            crate::MessageOffsetType::I64Offset,
+        ));
         assert!(again_null.is_ok_and(|x| x.is_none()));
         let should_not_be_null = cache.get(1, 0);
         assert!(should_not_be_null.is_ok_and(
@@ -1054,15 +1349,28 @@ mod Tests {
 
     #[test]
     fn test_segment_manager() {
-        let mut manager = SegmentManager::new(1, String::from("./data"), true, 1);
+        let mut manager = SegmentManager::new(
+            1,
+            String::from("./data"),
+            true,
+            1,
+            crate::MessageOffsetType::I64Offset,
+        );
         let mut cache = SegmentIndexPageCache::new(100);
         let bytes = "I am Shashi Kant.".as_bytes().to_owned().to_vec();
         let message = Message {
             message_bytes: bytes,
         };
-        let r = manager.add_message(message, &mut cache, 1);
+        let r = manager.add_message(
+            message,
+            &mut cache,
+            crate::MessageOffset::I64Offset(crate::MessageOffsetI64 { offset: 1 }),
+        );
         assert!(r.is_ok_and(|_| {
-            let res = manager.get_message(1, &mut cache);
+            let res = manager.get_message(
+                crate::MessageOffset::I64Offset(crate::MessageOffsetI64 { offset: 1 }),
+                &mut cache,
+            );
             res.is_ok_and(|y| {
                 y.is_some_and(|z| {
                     std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant."
@@ -1074,9 +1382,16 @@ mod Tests {
         let message = Message {
             message_bytes: bytes,
         };
-        let r = manager.add_message(message, &mut cache, 1);
+        let r = manager.add_message(
+            message,
+            &mut cache,
+            crate::MessageOffset::I64Offset(crate::MessageOffsetI64 { offset: 1 }),
+        );
         assert!(r.is_ok_and(|_| {
-            let res = manager.get_message(1, &mut cache);
+            let res = manager.get_message(
+                crate::MessageOffset::I64Offset(crate::MessageOffsetI64 { offset: 1 }),
+                &mut cache,
+            );
             res.is_ok_and(|y| {
                 y.is_some_and(|z| {
                     println!("{:?}", std::str::from_utf8(&z.message_bytes).unwrap());
@@ -1091,17 +1406,18 @@ mod Tests {
         let partition_bool = Partition::new(
             1,
             String::from("./data"),
-            1,
-            10,
+            crate::MessageOffset::I64Offset(crate::MessageOffsetI64 { offset: 1 }),
+            crate::MessageOffset::I64Offset(crate::MessageOffsetI64 { offset: 10 }),
             5,
-            10
+            10,
+            crate::MessageOffsetType::I64Offset,
         );
         let mut partition = partition_bool.0;
         let bytes = "I am Shashi Kant.".as_bytes().to_owned().to_vec();
         let message = Message {
             message_bytes: bytes,
         };
-        let r = partition.write_message(message);
+        let r = partition.write_message(message, None);
         println!("{:?}", r);
         assert!(r.is_ok_and(|x| {
             let res = partition.read_message(x);
@@ -1116,7 +1432,7 @@ mod Tests {
         let message = Message {
             message_bytes: bytes,
         };
-        let r = partition.write_message(message);
+        let r = partition.write_message(message, None);
         println!("{:?}", r);
         assert!(r.is_ok_and(|x| {
             let res = partition.read_message(x);
@@ -1127,7 +1443,6 @@ mod Tests {
                 })
             })
         }));
-
     }
 }
 
