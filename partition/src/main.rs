@@ -2,9 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
-use std::ops::Deref;
 use std::os::windows::prelude::FileExt;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::{fmt, fs};
 
 #[derive(Debug)]
@@ -197,14 +196,14 @@ impl PartialEq for MessageOffsetI64 {
 
 #[derive(Debug, Clone)]
 struct ConsumerMessageOffset {
-    consumer_group_id: i64,
-    partition_id: i64,
-    topic_id: i64,
+    consumer_group_id: i32,
+    partition_id: i32,
+    topic_id: i32,
 }
 
 impl ConsumerMessageOffset {
     fn size() -> i32 {
-        return 24;
+        return 12;
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -216,20 +215,20 @@ impl ConsumerMessageOffset {
     }
 
     fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut cid_bytes = [0u8; 8];
-        let mut pid_bytes = [0u8; 8];
-        let mut tid_bytes = [0u8; 8];
-        cid_bytes.copy_from_slice(&bytes[0..8]);
-        pid_bytes.copy_from_slice(&bytes[8..16]);
-        tid_bytes.copy_from_slice(&bytes[16..24]);
-        let cgid = i64::from_le_bytes(cid_bytes);
+        let mut cid_bytes = [0u8; 4];
+        let mut pid_bytes = [0u8; 4];
+        let mut tid_bytes = [0u8; 4];
+        cid_bytes.copy_from_slice(&bytes[0..4]);
+        pid_bytes.copy_from_slice(&bytes[4..8]);
+        tid_bytes.copy_from_slice(&bytes[8..12]);
+        let cgid = i32::from_le_bytes(cid_bytes);
         if cgid == 0 {
             return None;
         }
         return Some(Self {
             consumer_group_id: cgid,
-            partition_id: i64::from_le_bytes(pid_bytes),
-            topic_id: i64::from_le_bytes(tid_bytes),
+            partition_id: i32::from_le_bytes(pid_bytes),
+            topic_id: i32::from_le_bytes(tid_bytes),
         });
     }
 }
@@ -1074,7 +1073,7 @@ impl SegmentRangeIndex {
 
 #[derive(Debug)]
 struct Partition {
-    partition_id: i64,
+    partition_id: i32,
     cnt_range_start: MessageOffset,
     cnt_range_end: MessageOffset,
     cnt_msg_offset: Option<MessageOffset>,
@@ -1090,7 +1089,7 @@ struct Partition {
 
 impl Partition {
     fn new(
-        partition_id: i64,
+        partition_id: i32,
         folder: String,
         cnt_range_start: MessageOffset,
         cnt_range_end: MessageOffset,
@@ -1099,7 +1098,11 @@ impl Partition {
         offset_type: MessageOffsetType,
     ) -> (Self, bool) {
         //returns instance, boolean which is true if given range is used else existing half filled segmetn will be picked up.
-        let index_file = format!("{}/segment.index", &folder);
+        if !fs::metadata(format!("{}/{}", &folder, partition_id)).is_ok() {
+            fs::create_dir_all(format!("{}/{}", &folder, partition_id))
+                .expect("Unable to create folder.");
+        };
+        let index_file = format!("{}/{}/segment.index", &folder, partition_id);
         let mut index = SegmentRangeIndex::new(index_file, &offset_type);
         let first_segment = index
             .get_first(&offset_type)
@@ -1109,10 +1112,6 @@ impl Partition {
             .get_last(&offset_type)
             .map_err(|e| println!("{:?}", e))
             .unwrap();
-        if !fs::metadata(format!("{}/{}", &folder, partition_id)).is_ok() {
-            fs::create_dir_all(format!("{}/{}", &folder, partition_id))
-                .expect("Unable to create folder.");
-        };
         if first_segment.as_ref().is_none() || latest_segment.as_ref().is_none() {
             index
                 .add_segment(1, cnt_range_end.clone(), cnt_range_start.clone())
@@ -1144,6 +1143,7 @@ impl Partition {
                 true,
             );
         };
+        //@TODO below are the current ones, match with the provided ones, they must match.
         let cnt_range_start = latest_segment.as_ref().unwrap().segment_range_start.clone();
         let cnt_range_end = latest_segment.as_ref().unwrap().segment_range_end.clone();
         let cnt_active_segment_id = latest_segment.as_ref().unwrap().segment_id;
