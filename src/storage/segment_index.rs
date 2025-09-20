@@ -3,13 +3,14 @@ use super::{
     message::{MessageOffset, MessageOffsetType},
     segment::SegmentOffset,
 };
-use std::io::prelude::*;
-use std::os::windows::prelude::FileExt;
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
     sync::{Arc, Mutex, RwLock},
 };
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
+use tokio::fs;
+
 
 /*
 This struct represents a page of given number of records which holds the data of message offset and physical offsets in increasing order.
@@ -25,7 +26,7 @@ pub struct SegmentIndexPage {
 
 impl SegmentIndexPage {
     ///Creates new page.
-    pub fn new(
+    pub async fn new(
         max_number_of_records: i32,
         start_offset: i32,
         segment_id: i64,
@@ -61,7 +62,7 @@ impl SegmentIndexPage {
 
     ///Adds a given SegmentOffset to the page maintaining the sorted order.
     /// Returns None if page is overflowed.
-    pub fn get_last_written_segment(&self) -> Option<SegmentOffset> {
+    pub async fn get_last_written_segment(&self) -> Option<SegmentOffset> {
         let size = SegmentOffset::size_of_single_record(&self.offset_type);
         let mut lo = 0;
         let mut hi = self.max_number_of_records - 1;
@@ -82,7 +83,7 @@ impl SegmentIndexPage {
         return ans;
     }
 
-    pub fn add_segment_offset(&mut self, offset: &SegmentOffset) -> Option<()> {
+    pub async fn add_segment_offset(&mut self, offset: &SegmentOffset) -> Option<()> {
         //returns None if page is completely filled.
         let size = SegmentOffset::size_of_single_record(&self.offset_type);
         let mut lo = 0;
@@ -178,7 +179,7 @@ impl SegmentIndexPage {
     }
 
     /// Performs binary search to find the given message offset, returns None if not found.
-    pub fn get_segment_offset(&self, message_offset: MessageOffset) -> Option<SegmentOffset> {
+    pub async fn get_segment_offset(&self, message_offset: MessageOffset) -> Option<SegmentOffset> {
         let size = SegmentOffset::size_of_single_record(&self.offset_type);
         let mut lo = 0;
         let mut hi = self.max_number_of_records - 1;
@@ -187,20 +188,18 @@ impl SegmentIndexPage {
             let mut offset = SegmentOffset::from_bytes(
                 &self.bytes[(mid as usize) * (size as usize)..(mid as usize + 1) * (size as usize)],
             );
-            if offset
-                .as_ref()
-                .is_some_and(|x| x.message_offset == message_offset)
-            {
-                return offset;
-            } else if offset.as_ref().is_none()
-                || offset
-                    .as_ref()
-                    .is_some_and(|x| x.message_offset > message_offset)
-            {
-                hi = mid - 1;
+            if let Some(x) = offset.as_ref() {
+                if x.message_offset == message_offset {
+                    return offset;
+                } else if x.message_offset > message_offset {
+                    hi = mid - 1;
+                } else {
+                    lo = mid + 1;
+                }
             } else {
-                lo = mid + 1;
-            }
+                // offset is None
+                hi = mid - 1;
+            }            
         }
         return None;
     }
@@ -212,16 +211,15 @@ This struct is responsible for the storing the message offsets and physical offs
 #[derive(Debug)]
 pub struct SegmentIndex {
     pub segment_id: i64,
-    pub file: String,
-    pub active: bool,
-    pub write_handler: Option<File>,
+    file: String,
+    active: bool,
+    write_handler: Option<File>,
     pub number_of_bytes: usize,
-    pub index_mutex: Mutex<()>,
     pub offset_type: MessageOffsetType,
 }
 
 impl SegmentIndex {
-    pub fn new(
+    pub async fn new(
         segment_id: i64,
         folder: String,
         active: bool,
@@ -236,6 +234,7 @@ impl SegmentIndex {
                     .write(true)
                     .read(true)
                     .open(String::from(&file))
+                    .await
                     .expect(&format!("Could not open file {}", &file)),
             );
         } else {
@@ -245,8 +244,9 @@ impl SegmentIndex {
             .read(true)
             .write(false)
             .open(String::from(&file))
+            .await
             .expect(&format!("Could not open file {}", &file));
-        let metadata = fs::metadata(String::from(&file)).expect("Could not load file");
+        let metadata = fs::metadata(String::from(&file)).await.expect("Could not load file");
         let number_of_bytes = metadata.len();
         return Self {
             segment_id: segment_id,
@@ -254,18 +254,17 @@ impl SegmentIndex {
             active: true,
             write_handler: write_handler,
             number_of_bytes: number_of_bytes as usize,
-            index_mutex: Mutex::new(()),
             offset_type: offset_type,
         };
     }
 
-    pub fn deactivate(&mut self) {
+    pub async fn deactivate(&mut self) {
         self.active = false;
         self.write_handler = None;
     }
 
     /// Returns page starting from given offset.
-    pub fn get_page(
+    pub async fn get_page(
         &self,
         start_offset: i32,
         number_of_records: i32,
@@ -273,11 +272,13 @@ impl SegmentIndex {
         let size = SegmentOffset::size_of_single_record(&self.offset_type);
         let number_of_bytes = number_of_records * size;
         let mut buf = vec![0u8; number_of_bytes as usize];
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(false)
-            .open(String::from(&self.file))?;
-        file.seek_read(&mut buf, start_offset as u64)?;
+            .open(String::from(&self.file))
+            .await?;
+        let _ = file.seek(io::SeekFrom::Start(start_offset as u64)).await?;
+        file.read(&mut buf).await?;
         return Ok(SegmentIndexPage {
             start_offset: start_offset,
             segment_id: self.segment_id,
@@ -288,27 +289,24 @@ impl SegmentIndex {
     }
 
     ///Writes the page to the index file.
-    pub fn write_page(&mut self, page: &SegmentIndexPage) -> Result<(), MessageIOError> {
-        let _guard = self
-            .index_mutex
-            .lock()
-            .map_err(|x| MessageIOError::CustomError(format!("Poisened Lock {:?}", x)))?;
+    pub async fn write_page(&mut self, page: &SegmentIndexPage) -> Result<(), MessageIOError> {
         if !self.active {
             return Err(MessageIOError::SegmentOverFlow(String::from(
                 "This segment has already been closed for writing.",
             )));
         }
         self.write_handler
-            .as_ref()
+            .as_mut()
             .unwrap()
-            .seek_write(&page.bytes, page.start_offset as u64)?;
-        self.write_handler.as_ref().unwrap().flush()?;
+            .seek(io::SeekFrom::Start(page.start_offset as u64)).await?;
+        self.write_handler.as_mut().unwrap().write(&page.bytes).await?;
+        self.write_handler.as_mut().unwrap().flush().await?;
         self.number_of_bytes += &page.bytes.len();
         return Ok(());
     }
 
     ///Returns the latest page which is being written.
-    pub fn get_cnt_page_being_written(
+    pub async fn get_cnt_page_being_written(
         &self,
         max_number_of_records_in_page: i32,
     ) -> Result<SegmentIndexPage, MessageIOError> {
@@ -316,7 +314,7 @@ impl SegmentIndex {
         let page_size = size * max_number_of_records_in_page;
         let number_of_pages = self.number_of_bytes as i32 / page_size;
         let start_offset = number_of_pages * page_size;
-        return self.get_page(start_offset, max_number_of_records_in_page);
+        return self.get_page(start_offset, max_number_of_records_in_page).await;
     }
 }
 
@@ -326,9 +324,9 @@ A simple index page cache implementation which uses only hashmap. Later more gre
 
 #[derive(Debug)]
 pub struct SegmentIndexPageCache {
-    pub store: Arc<RwLock<HashMap<i64, HashMap<i32, SegmentIndexPage>>>>,
-    pub max_pages_to_store: i32,
-    pub current_number_of_pages: i32,
+    store: Arc<RwLock<HashMap<i64, HashMap<i32, SegmentIndexPage>>>>,
+    max_pages_to_store: i32,
+    current_number_of_pages: i32,
 }
 
 impl SegmentIndexPageCache {
@@ -453,45 +451,43 @@ impl SegmentRange {
 pub struct SegmentRangeIndex {
     pub number_of_rows: i32,
     pub file: String,
-    pub write_handler: File,
-    index_mutex: Mutex<()>,
+    pub write_handler: File
 }
 
 impl SegmentRangeIndex {
-    pub fn new(file: String, offset_type: &MessageOffsetType) -> Self {
+    pub async fn new(file: String, offset_type: &MessageOffsetType) -> Self {
         let w_file = OpenOptions::new()
             .create(true)
             .write(true)
             .append(true)
             .open(String::from(&file))
+            .await
             .expect(&format!("File could not be opened {:?}", &file));
-        let metadata = fs::metadata(String::from(&file)).expect("Could not load file");
+        let metadata = fs::metadata(String::from(&file)).await.expect("Could not load file");
         let number_of_bytes = metadata.len() as i32;
         let number_of_rows = number_of_bytes / SegmentRange::size_of_single_record(offset_type);
         return Self {
             number_of_rows: number_of_rows,
             file: file,
             write_handler: w_file,
-            index_mutex: Mutex::new(()),
         };
     }
 
-    pub fn add_segment(
+    pub async fn add_segment(
         &mut self,
         segment_id: i64,
         segment_range_end: MessageOffset,
         segment_range_start: MessageOffset,
     ) -> Result<(), MessageIOError> {
-        let _guard = self.index_mutex.lock().unwrap();
         self.write_handler.write(
             &SegmentRange::new(segment_id, segment_range_start, segment_range_end).to_bytes(),
-        )?;
+        ).await?;
         self.number_of_rows += 1;
-        self.write_handler.flush()?;
+        self.write_handler.flush().await?;
         return Ok(());
     }
 
-    pub fn find_segment(
+    pub async fn find_segment(
         &self,
         message_offset: MessageOffset,
         offset_type: &MessageOffsetType,
@@ -500,13 +496,15 @@ impl SegmentRangeIndex {
         let size = SegmentRange::size_of_single_record(offset_type);
         let mut lo = 0;
         let mut hi = self.number_of_rows - 1;
-        let r_file = OpenOptions::new()
+        let mut r_file = OpenOptions::new()
             .read(true)
-            .open(String::from(&self.file))?;
+            .open(String::from(&self.file))
+            .await?;
         while lo <= hi {
             let mid = (lo + hi) / 2;
             let mut bytes = vec![0u8; size as usize];
-            r_file.seek_read(&mut bytes, mid as u64 * size as u64)?;
+            let _ = r_file.seek(io::SeekFrom::Start(mid as u64 * size as u64)).await?;
+            r_file.read(&mut bytes).await?;
             let range = SegmentRange::from_bytes(&bytes, offset_type);
             if range.segment_range_start <= message_offset
                 && message_offset <= range.segment_range_end
@@ -521,7 +519,7 @@ impl SegmentRangeIndex {
         return Ok(None);
     }
 
-    pub fn get_first(
+    pub async fn get_first(
         &self,
         offset_type: &MessageOffsetType,
     ) -> Result<Option<SegmentRange>, MessageIOError> {
@@ -530,16 +528,18 @@ impl SegmentRangeIndex {
             return Ok(None);
         } else {
             let size = SegmentRange::size_of_single_record(offset_type);
-            let r_file = OpenOptions::new()
+            let mut r_file = OpenOptions::new()
                 .read(true)
-                .open(String::from(&self.file))?;
+                .open(String::from(&self.file))
+                .await?;
             let mut bytes = vec![0u8; size as usize];
-            r_file.seek_read(&mut bytes, 0)?;
+            let _ = r_file.seek(io::SeekFrom::Start(0)).await?;
+            r_file.read(&mut bytes).await?;
             return Ok(Some(SegmentRange::from_bytes(&bytes, offset_type)));
         }
     }
 
-    pub fn get_last(
+    pub async fn get_last(
         &self,
         offset_type: &MessageOffsetType,
     ) -> Result<Option<SegmentRange>, MessageIOError> {
@@ -547,27 +547,31 @@ impl SegmentRangeIndex {
             return Ok(None);
         } else {
             let size = SegmentRange::size_of_single_record(offset_type);
-            let r_file = OpenOptions::new()
+            let mut r_file = OpenOptions::new()
                 .read(true)
-                .open(String::from(&self.file))?;
+                .open(String::from(&self.file))
+                .await?;
             let mut bytes = vec![0u8; size as usize];
-            r_file.seek_read(&mut bytes, (self.number_of_rows - 1) as u64 * size as u64)?;
+            let _ = r_file.seek(io::SeekFrom::Start((self.number_of_rows - 1) as u64 * size as u64)).await?;
+            r_file.read(&mut bytes ).await?;
             return Ok(Some(SegmentRange::from_bytes(&bytes, offset_type)));
         }
     }
 
-    pub fn get_all(
+    pub async fn get_all(
         &self,
         offset_type: &MessageOffsetType,
     ) -> Result<Vec<SegmentRange>, MessageIOError> {
         let size = SegmentRange::size_of_single_record(offset_type);
-        let r_file = OpenOptions::new()
+        let mut r_file = OpenOptions::new()
             .read(true)
-            .open(String::from(&self.file))?;
+            .open(String::from(&self.file))
+            .await?;
         let mut segments = vec![];
         for i in 0..self.number_of_rows {
             let mut bytes = vec![0u8; size as usize];
-            r_file.seek_read(&mut bytes, i as u64 * size as u64)?;
+            let _ = r_file.seek(io::SeekFrom::Start(i as u64 * size as u64)).await?;
+            r_file.read(&mut bytes).await?;
             segments.push(SegmentRange::from_bytes(&bytes, offset_type));
         }
         return Ok(segments);

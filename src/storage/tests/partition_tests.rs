@@ -2,8 +2,8 @@
 mod partition_tests {
     use crate::storage::{message::{ConsumerMessageOffset, Message, MessageOffset, MessageOffsetI64, MessageOffsetType}, partition::Partition};
 
-    #[test]
-    fn test_partition() {
+    #[tokio::test]
+    async fn test_partition() {
         let partition_bool = Partition::new(
             1,
             String::from("./temp"),
@@ -12,42 +12,40 @@ mod partition_tests {
             5,
             10,
             MessageOffsetType::I64Offset,
-        );
+        ).await;
         let mut partition = partition_bool.0;
         let bytes = "I am Shashi Kant.".as_bytes().to_owned().to_vec();
         let message = Message {
             message_bytes: bytes,
         };
-        let r = partition.write_message(message, None);
+        let r = partition.write_message(message, None).await;
         println!("{:?}", r);
-        assert!(r.is_ok_and(|x| {
-            let res = partition.read_message(x);
-            println!("{:?}", res);
-            res.is_ok_and(|y| {
-                y.is_some_and(|z| {
-                    std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant."
-                })
-            })
-        }));
+        assert!(r.is_ok());
+        let x = r.unwrap();
+        let res = partition.read_message(x).await;
+        println!("{:?}", res);
+        assert!(match res {
+            Ok(Some(z)) => std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant.",
+            _ => false,
+        });
         let bytes = "I am Shashi Kant the Dev.".as_bytes().to_owned().to_vec();
         let message = Message {
             message_bytes: bytes,
         };
-        let r = partition.write_message(message, None);
+        let r = partition.write_message(message, None).await;
         println!("{:?}", r);
-        assert!(r.is_ok_and(|x| {
-            let res = partition.read_message(x);
-            println!("{:?}", res);
-            res.is_ok_and(|y| {
-                y.is_some_and(|z| {
-                    std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant the Dev."
-                })
-            })
-        }));
+        assert!(r.is_ok());
+        let x = r.unwrap();
+        let res = partition.read_message(x).await;
+        println!("{:?}", res);
+        assert!(match res {
+            Ok(Some(z)) => std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant the Dev.",
+            _ => false,
+        });        
     }
 
-    #[test]
-    fn test_partition_with_consumer_offsets() {
+    #[tokio::test]
+    async fn test_partition_with_consumer_offsets() {
         let partition_bool = Partition::new(
             2,
             String::from("./temp"),
@@ -64,7 +62,7 @@ mod partition_tests {
             5,
             10,
             MessageOffsetType::ConsumerOffset,
-        );
+        ).await;
         let mut partition = partition_bool.0;
         let bytes = "I am Shashi Kant.".as_bytes().to_owned().to_vec();
         let message = Message {
@@ -74,17 +72,16 @@ mod partition_tests {
             consumer_group_id: 1,
             partition_id: 10,
             topic_id: 20
-        })));
+        }))).await;
         println!("{:?}", r);
-        assert!(r.is_ok_and(|x| {
-            let res = partition.read_message(x);
-            println!("{:?}", res);
-            res.is_ok_and(|y| {
-                y.is_some_and(|z| {
-                    std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant."
-                })
-            })
-        }));
+        assert!(r.is_ok());
+        let x = r.unwrap();
+        let res = partition.read_message(x).await;
+        println!("{:?}", res);
+        assert!(match res {
+            Ok(Some(z)) => std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant.",
+            _ => false,
+        });
         let bytes = "I am Shashi Kant the Dev.".as_bytes().to_owned().to_vec();
         let message = Message {
             message_bytes: bytes,
@@ -93,16 +90,14 @@ mod partition_tests {
             consumer_group_id: 1,
             partition_id: 11,
             topic_id: 20
-        })));
+        }))).await;
         println!("{:?}", r);
-        assert!(r.is_ok_and(|x| {
-            let res = partition.read_message(x);
-            println!("{:?}", res);
-            res.is_ok_and(|y| {
-                y.is_some_and(|z| {
-                    std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant the Dev."
-                })
-            })
-        }));
+        assert!(r.is_ok());
+        let x = r.unwrap();
+        let res = partition.read_message(x).await;
+        assert!(match res {
+            Ok(Some(z)) => std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant the Dev.",
+            _ => false,
+        });
     }
 }

@@ -2,15 +2,15 @@
 mod segment_tests {
     use crate::storage::{message::{Message, MessageOffset, MessageOffsetI64, MessageOffsetType}, segment::{Segment, SegmentManager, SegmentOffset}, segment_index::{SegmentIndexPage, SegmentIndexPageCache}};
 
-    #[test]
-    fn test_segment_functions() {
-        let mut segment = Segment::new(1, String::from("./temp"), true);
+    #[tokio::test]
+    async fn test_segment_functions() {
+        let mut segment = Segment::new(1, String::from("./temp"), true).await;
         let bytes = "I am Shashi Kant.".as_bytes();
         let res = segment.add_message(Message {
             message_bytes: bytes.to_owned().into(),
-        });
+        }).await;
         if let Ok(offset) = res {
-            let message_res = segment.read_message(offset);
+            let message_res = segment.read_message(offset).await;
             if let Ok(message) = message_res {
                 let msg_str = std::str::from_utf8(&message.message_bytes).unwrap();
                 assert_eq!(msg_str, "I am Shashi Kant.");
@@ -24,15 +24,15 @@ mod segment_tests {
         }
     }
 
-    #[test]
-    fn test_segment_manager() {
+    #[tokio::test]
+    async fn test_segment_manager() {
         let mut manager = SegmentManager::new(
             1,
             String::from("./temp"),
             true,
             1,
             MessageOffsetType::I64Offset,
-        );
+        ).await;
         let mut cache = SegmentIndexPageCache::new(100);
         let bytes = "I am Shashi Kant.".as_bytes().to_owned().to_vec();
         let message = Message {
@@ -42,18 +42,16 @@ mod segment_tests {
             message,
             &mut cache,
             MessageOffset::I64Offset(MessageOffsetI64 { offset: 1 }),
-        );
-        assert!(r.is_ok_and(|_| {
-            let res = manager.get_message(
-                MessageOffset::I64Offset(MessageOffsetI64 { offset: 1 }),
-                &mut cache,
-            );
-            res.is_ok_and(|y| {
-                y.is_some_and(|z| {
-                    std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant."
-                })
-            })
-        }));
+        ).await;
+        assert!(r.is_ok());
+        let res = manager.get_message(
+            MessageOffset::I64Offset(MessageOffsetI64 { offset: 1 }),
+            &mut cache,
+        ).await;
+        assert!(match res {
+            Ok(Some(z)) => std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant.",
+            _ => false,
+        });
 
         let bytes = "I am Shashi Kant the Dev.".as_bytes().to_owned().to_vec();
         let message = Message {
@@ -63,55 +61,60 @@ mod segment_tests {
             message,
             &mut cache,
             MessageOffset::I64Offset(MessageOffsetI64 { offset: 1 }),
-        );
-        assert!(r.is_ok_and(|_| {
-            let res = manager.get_message(
-                MessageOffset::I64Offset(MessageOffsetI64 { offset: 1 }),
-                &mut cache,
-            );
-            res.is_ok_and(|y| {
-                y.is_some_and(|z| {
-                    println!("{:?}", std::str::from_utf8(&z.message_bytes).unwrap());
-                    std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant the Dev."
-                })
-            })
-        }));
+        ).await;
+        assert!(r.is_ok());
+        let res = manager.get_message(
+            MessageOffset::I64Offset(MessageOffsetI64 { offset: 1 }),
+            &mut cache,
+        ).await;
+        assert!(match res {
+            Ok(Some(z)) => std::str::from_utf8(&z.message_bytes).unwrap() == "I am Shashi Kant the Dev.",
+            _ => false,
+        });
     }
 
-    #[test]
-    fn test_segment_index_page() {
-        let mut page = SegmentIndexPage::new(100, 0, 1, MessageOffsetType::I64Offset);
+    #[tokio::test]
+    async fn test_segment_index_page() {
+        let mut page = SegmentIndexPage::new(100, 0, 1, MessageOffsetType::I64Offset).await;
         let segment = SegmentOffset {
             message_offset: MessageOffset::I64Offset(MessageOffsetI64 { offset: 1 }),
             physical_offset: 1,
         };
-        page.add_segment_offset(&segment);
+        page.add_segment_offset(&segment).await;
         let searched_segment =
             page.get_segment_offset(MessageOffset::I64Offset(MessageOffsetI64 {
                 offset: 1,
-            }));
-        assert!(
-            searched_segment.is_some_and(|o| o.message_offset == segment.message_offset
-                && o.physical_offset == segment.physical_offset)
-        )
+            })).await;
+        assert!(match searched_segment {
+            Some(ref o) => o.message_offset == segment.message_offset
+                && o.physical_offset == segment.physical_offset,
+            None => false,
+        });
     }
 
-    #[test]
-    fn test_segment_index_page_cache() {
+    #[tokio::test]
+    async fn test_segment_index_page_cache() {
         let mut cache = SegmentIndexPageCache::new(5);
         let should_be_null = cache.get(1, 0);
-        assert!(should_be_null.is_ok_and(|x| x.is_none()));
+        assert!(match should_be_null {
+            Ok(ref x) => x.is_none(),
+            Err(_) => false,
+        });
         let again_null = cache.set(SegmentIndexPage::new(
             5,
             0,
             1,
             MessageOffsetType::I64Offset,
-        ));
-        assert!(again_null.is_ok_and(|x| x.is_none()));
+        ).await);
+        assert!(match again_null {
+            Ok(ref x) => x.is_none(),
+            Err(_) => false,
+        });        
         let should_not_be_null = cache.get(1, 0);
-        assert!(should_not_be_null.is_ok_and(
-            |x| x.is_some_and(|x| { x.segment_id == 1 && x.max_number_of_records == 5 })
-        ));
+        assert!(match should_not_be_null {
+            Ok(Some(ref x)) => x.segment_id == 1 && x.max_number_of_records == 5,
+            _ => false,
+        });        
     }
     
 }
